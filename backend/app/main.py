@@ -8,13 +8,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import api_router
 from app.config import settings
 from app.core.logging import configure_logging
+from app.db import base as _db_base  # noqa: F401 — import registers every ORM model
+from app.simulation.engine import SimulationService
+from app.websocket.router import websocket_router
 
 configure_logging()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield
+    # The simulation lives on app.state (not a bare module-level global) so
+    # it stays request-accessible via Depends(get_simulation) while still
+    # being trivially swappable in tests.
+    simulation = SimulationService()
+    app.state.simulation = simulation
+    await simulation.start()
+    try:
+        yield
+    finally:
+        await simulation.stop()
 
 
 def create_app() -> FastAPI:
@@ -34,6 +46,7 @@ def create_app() -> FastAPI:
         )
 
     app.include_router(api_router)
+    app.include_router(websocket_router)
     return app
 
 

@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     REDIS_PORT: int = 6379
     REDIS_DB: int = 0
 
+    # --- Simulation ---
+    # How often (seconds) the digital twin recomputes telemetry and
+    # broadcasts a snapshot to connected WebSocket clients.
+    SIMULATION_TICK_SECONDS: float = 1.0
+
     @property
     def SQLALCHEMY_DATABASE_URI(self) -> str:
         return (

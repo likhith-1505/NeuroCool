@@ -1,1 +1,1 @@
-"""Shared utility helpers (empty scaffold)."""
+"""Shared utility helpers."""
