@@ -14,3 +14,11 @@ class EventSeverity(str, enum.Enum):
     INFO = "info"
     WARNING = "warning"
     CRITICAL = "critical"
+
+
+class DecisionStatus(str, enum.Enum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    EXECUTED = "executed"
+    EXPIRED = "expired"

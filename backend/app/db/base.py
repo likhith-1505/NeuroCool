@@ -6,6 +6,7 @@ that autogenerate can see the complete schema.
 
 from app.db.base_class import Base
 from app.models.cluster import Cluster
+from app.models.decision import Decision
 from app.models.event import Event
 from app.models.rack import Rack
 from app.models.scenario import Scenario
@@ -18,4 +19,5 @@ __all__ = [
     "TelemetryRecord",
     "Scenario",
     "Event",
+    "Decision",
 ]

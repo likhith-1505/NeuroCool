@@ -12,6 +12,13 @@ ScenarioManager for this tick's per-rack RackDrivers and folds them into the
 same physics call every tick already made, and it is the only place that
 turns a scenario transition into a persisted + broadcast Event, exactly as
 it already does for ordinary telemetry events.
+
+Decision orchestration follows the identical pattern: this class owns a
+DecisionService (see app.ai.service), asks it to evaluate the cluster every
+tick, and folds the lifecycle events it returns into the same broadcast.
+Which reasoning strategy DecisionService uses (RuleBasedDecisionEngine
+today) is a construction-time detail — see __init__ — not something this
+class, the REST API, or the WebSocket endpoint need to know about.
 """
 
 from __future__ import annotations
@@ -26,10 +33,14 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai.rules import RuleBasedDecisionEngine
+from app.ai.service import DecisionService
 from app.config import settings
 from app.db.session import AsyncSessionLocal
 from app.models.cluster import Cluster
+from app.models.decision import Decision
 from app.models.enums import EventSeverity, RackStatus
+from app.models.event import Event
 from app.models.rack import Rack
 from app.models.scenario import Scenario
 from app.schemas.event import EventRead
@@ -46,12 +57,18 @@ from app.websocket.manager import manager
 logger = logging.getLogger(__name__)
 
 # Sane starting point for a freshly-seeded, "just booted" rack — the
-# physics chain takes it from here every subsequent tick.
-_INITIAL_TEMPERATURE_C = 60.0
-_INITIAL_CPU_UTILIZATION = 40.0
-_INITIAL_POWER_KW = 8.0
-_INITIAL_COOLING_EFFICIENCY = 65.0
-_INITIAL_FAN_SPEED = 40.0
+# physics chain takes it from here every subsequent tick. Chosen close to
+# the physics engine's own equilibrium for a mid-range baseline GPU load
+# (worked out from compute_next_rack_state's target formulas) rather than
+# an arbitrary round number, so there's only a small settling transient on
+# boot instead of a multi-tick "temperature rising, cooling falling" ramp
+# that would otherwise look identical to genuine degradation to
+# RuleBasedDecisionEngine's trend-based rules (see app.ai.rules).
+_INITIAL_TEMPERATURE_C = 64.0
+_INITIAL_CPU_UTILIZATION = 41.0
+_INITIAL_POWER_KW = 9.3
+_INITIAL_COOLING_EFFICIENCY = 58.5
+_INITIAL_FAN_SPEED = 36.0
 _INITIAL_HEALTH_SCORE = 90.0
 
 # Titles for the event raised the moment a scenario is activated. "normal"
@@ -90,6 +107,7 @@ class SimulationService:
         self._last_tick_at: datetime | None = None
         self._scenario_manager = ScenarioManager()
         self._scenario_db_ids: dict[str, uuid.UUID] = {}
+        self._decision_service = DecisionService(engine=RuleBasedDecisionEngine())
 
     # --- lifecycle -----------------------------------------------------
 
@@ -183,6 +201,50 @@ class SimulationService:
         await self._emit_scenario_event(definition, kind="activate")
         return self.scenario_status
 
+    # --- decisions (called from the REST API) -------------------------------
+
+    @property
+    def active_decisions(self) -> list[Decision]:
+        """Currently pending/accepted decisions — what TelemetrySnapshot exposes."""
+        return self._decision_service.active_decisions
+
+    @property
+    def all_decisions(self) -> list[Decision]:
+        return self._decision_service.all_decisions
+
+    def get_decision(self, decision_id: uuid.UUID) -> Decision | None:
+        return self._decision_service.get(decision_id)
+
+    async def accept_decision(self, decision_id: uuid.UUID) -> Decision:
+        """Raises LookupError (-> 404) or ValueError (-> 400) at the API layer."""
+        decision, events = await self._decision_service.accept(decision_id)
+        await self._broadcast_decision_events(events)
+        return decision
+
+    async def reject_decision(self, decision_id: uuid.UUID) -> Decision:
+        decision, events = await self._decision_service.reject(decision_id)
+        await self._broadcast_decision_events(events)
+        return decision
+
+    async def execute_decision(self, decision_id: uuid.UUID) -> Decision:
+        """Updates decision state only — actual remediation is out of scope
+        for now (see the objective this was implemented under).
+        """
+        decision, events = await self._decision_service.execute(decision_id)
+        await self._broadcast_decision_events(events)
+        return decision
+
+    async def _broadcast_decision_events(self, events: list[Event]) -> None:
+        """Immediate broadcast for a REST-triggered decision transition —
+        the tick loop's regular broadcast already covers decisions that
+        change as part of a tick (creation, expiry, confidence updates);
+        this covers accept/reject/execute, which happen between ticks.
+        """
+        events_payload = [EventRead.model_validate(event).model_dump(mode="json") for event in events]
+        for event in events:
+            logger.info("Event: [%s] %s", event.severity.value, event.title)
+        await self._broadcast(events_payload)
+
     # --- tick loop -------------------------------------------------------
 
     async def _run(self) -> None:
@@ -233,14 +295,28 @@ class SimulationService:
         self._cluster = compute_cluster_state(cluster_id, self._cluster.name, list(self._racks.values()))
         self._last_tick_at = now
 
-        events_payload: list[dict] = []
+        persisted: list[Event] = []
         if drafts:
             async with AsyncSessionLocal() as db:
                 persisted = await persist_events(db, drafts)
-            events_payload = [EventRead.model_validate(event).model_dump(mode="json") for event in persisted]
             for event in persisted:
                 logger.info("Event: [%s] %s", event.severity.value, event.title)
 
+        # The DecisionEngine evaluates every tick, exactly like the physics
+        # step — it only ever sees the resulting telemetry, never which
+        # scenario (if any) produced it.
+        decision_events = await self._decision_service.evaluate(
+            cluster=self._cluster,
+            racks=list(self._racks.values()),
+            scenario_key=self._scenario_manager.active_key,
+            scenario_target_rack_id=self._scenario_manager.target_rack_id,
+            cluster_db_id=cluster_id,
+            scenario_db_id=active_scenario_db_id,
+            now=now,
+        )
+        persisted.extend(decision_events)
+
+        events_payload = [EventRead.model_validate(event).model_dump(mode="json") for event in persisted]
         await self._broadcast(events_payload)
 
     async def _broadcast(self, events_payload: list[dict]) -> None:
