@@ -22,3 +22,16 @@ class DecisionStatus(str, enum.Enum):
     REJECTED = "rejected"
     EXECUTED = "executed"
     EXPIRED = "expired"
+
+
+class ExecutionActionType(str, enum.Enum):
+    WORKLOAD_MIGRATION = "workload_migration"
+    COOLING_ADJUSTMENT = "cooling_adjustment"
+    JOB_DELAY = "job_delay"
+    CLUSTER_REBALANCE = "cluster_rebalance"
+
+
+class ExecutionStatus(str, enum.Enum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"

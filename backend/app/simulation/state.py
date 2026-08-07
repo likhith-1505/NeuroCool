@@ -65,17 +65,46 @@ class ClusterState:
 class RackDrivers:
     """External bias applied to one rack's targets for a single physics tick.
 
-    This is the seam ScenarioManager uses to "influence the simulator
-    through inputs" (per design) without touching the physics engine's own
-    logic: every field defaults to a no-op, so a rack with no active
-    scenario influence behaves exactly as if RackDrivers didn't exist. The
-    physics engine folds these into targets it was already computing — it
-    gains no new branches per scenario.
+    This is the seam both ScenarioManager and ExecutionManager use to
+    "influence the simulator through inputs" (per design) without touching
+    the physics engine's own logic: every field defaults to a no-op, so a
+    rack with no active influence behaves exactly as if RackDrivers didn't
+    exist. The physics engine folds these into targets it was already
+    computing — it gains no new branches per scenario or per remediation
+    action.
+
+    gpu_bias / power_bias_kw / cooling_ceiling are ScenarioManager's original
+    fields (workload-driven incidents). fan_bias / cooling_bias exist for
+    ExecutionManager's remediation actions (see app.execution) — a "cooling
+    adjustment" execution pushes fans harder and boosts cooling capacity
+    directly, the mirror image of a cooling_ceiling cap.
     """
 
     gpu_bias: float = 0.0
     cooling_ceiling: float | None = None
     power_bias_kw: float = 0.0
+    fan_bias: float = 0.0
+    cooling_bias: float = 0.0
 
 
 NO_DRIVERS = RackDrivers()
+
+
+def combine_drivers(*drivers: RackDrivers) -> RackDrivers:
+    """Merge multiple RackDrivers acting on the same rack into one: bias
+    fields add together, cooling_ceiling takes the most restrictive (lowest)
+    value set, if any. Used to combine scenario-driven and execution-driven
+    influences within a single tick — e.g. an active "cooling adjustment"
+    execution trying to boost cooling while a cooling_failure scenario is
+    still capping it, which is exactly the realistic tension that should
+    happen when a remediation partially — not fully — compensates for an
+    ongoing external cause.
+    """
+    ceilings = [d.cooling_ceiling for d in drivers if d.cooling_ceiling is not None]
+    return RackDrivers(
+        gpu_bias=sum(d.gpu_bias for d in drivers),
+        cooling_ceiling=min(ceilings) if ceilings else None,
+        power_bias_kw=sum(d.power_bias_kw for d in drivers),
+        fan_bias=sum(d.fan_bias for d in drivers),
+        cooling_bias=sum(d.cooling_bias for d in drivers),
+    )

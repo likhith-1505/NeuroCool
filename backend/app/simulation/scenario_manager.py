@@ -85,6 +85,14 @@ SCENARIOS: dict[str, ScenarioDefinition] = {
             duration_seconds=None,
             gpu_bias=45.0,
             neighbor_gpu_bias=10.0,
+            # gpu_bias alone saturates gpu_utilization near 100% quickly,
+            # after which more of it barely raises heat further — so without
+            # this, cooling's negative feedback loop keeps equilibrium
+            # temperature hovering just under the workload-migration
+            # decision rule's 82°C threshold more often than not. A modest
+            # extra power draw (PSU/VRM losses under sustained peak load,
+            # not modeled by GPU utilization alone) reliably pushes it over.
+            power_bias_kw=3.0,
         ),
         ScenarioDefinition(
             key="cooling_failure",

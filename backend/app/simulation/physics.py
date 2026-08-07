@@ -183,9 +183,11 @@ def compute_next_rack_state(
     power_draw = ease(previous.power_draw, power_target, POWER_EASE_RATE)
 
     # 4) Fans respond to *current* temperature — this is what creates the
-    #    negative-feedback cooling loop instead of an open one.
+    #    negative-feedback cooling loop instead of an open one. A "cooling
+    #    adjustment" execution adds fan_bias to push fan_target harder than
+    #    temperature alone would justify (a real fan-curve override).
     fan_target = clamp(
-        FAN_IDLE_SPEED + (previous.temperature - COMFORTABLE_TEMPERATURE_C) * FAN_GAIN,
+        FAN_IDLE_SPEED + (previous.temperature - COMFORTABLE_TEMPERATURE_C) * FAN_GAIN + drivers.fan_bias,
         FAN_IDLE_SPEED,
         100.0,
     )
@@ -196,9 +198,13 @@ def compute_next_rack_state(
     #    cooling-failure scenario caps this target directly: fan_target
     #    above is untouched (fans still visibly saturate trying to help),
     #    but the efficiency they'd normally produce is capped regardless —
-    #    exactly modeling "the fans work, the cooling doesn't."
+    #    exactly modeling "the fans work, the cooling doesn't." A "cooling
+    #    adjustment" execution instead adds cooling_bias, representing
+    #    intervention beyond fan speed (e.g. coolant flow) — applied before
+    #    any ceiling, so an ongoing failure's cap still ultimately wins if
+    #    both are active, which is the realistic outcome.
     cooling_target = clamp(
-        BASE_COOLING_EFFICIENCY + (fan_speed - FAN_IDLE_SPEED) * COOLING_GAIN,
+        BASE_COOLING_EFFICIENCY + (fan_speed - FAN_IDLE_SPEED) * COOLING_GAIN + drivers.cooling_bias,
         30.0,
         99.0,
     )

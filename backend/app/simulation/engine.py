@@ -19,6 +19,13 @@ tick, and folds the lifecycle events it returns into the same broadcast.
 Which reasoning strategy DecisionService uses (RuleBasedDecisionEngine
 today) is a construction-time detail — see __init__ — not something this
 class, the REST API, or the WebSocket endpoint need to know about.
+
+Execution closes the loop: this class also owns an ExecutionService (see
+app.execution.service), which POST /api/decisions/{id}/execute triggers via
+execute_decision. Every tick, its RackDrivers contribution is combined
+(see combine_drivers) with the scenario's and fed into the exact same
+physics call — an executed remediation is just another input the physics
+engine already knew how to accept, never a special-cased temperature write.
 """
 
 from __future__ import annotations
@@ -37,10 +44,12 @@ from app.ai.rules import RuleBasedDecisionEngine
 from app.ai.service import DecisionService
 from app.config import settings
 from app.db.session import AsyncSessionLocal
+from app.execution.service import ExecutionService
 from app.models.cluster import Cluster
 from app.models.decision import Decision
 from app.models.enums import EventSeverity, RackStatus
 from app.models.event import Event
+from app.models.execution import Execution
 from app.models.rack import Rack
 from app.models.scenario import Scenario
 from app.schemas.event import EventRead
@@ -50,7 +59,7 @@ from app.services.event_service import EventDraft, detect_rack_events, persist_e
 from app.simulation.physics import compute_cluster_state, compute_next_rack_state
 from app.simulation.scenario_manager import SCENARIOS, ScenarioDefinition, ScenarioManager
 from app.simulation.seed import DEFAULT_CLUSTER_LOCATION, DEFAULT_CLUSTER_NAME, RACK_SEEDS
-from app.simulation.state import NO_DRIVERS, ClusterState, RackInternals, RackState
+from app.simulation.state import NO_DRIVERS, ClusterState, RackInternals, RackState, combine_drivers
 from app.utils.time import utcnow
 from app.websocket.manager import manager
 
@@ -108,6 +117,7 @@ class SimulationService:
         self._scenario_manager = ScenarioManager()
         self._scenario_db_ids: dict[str, uuid.UUID] = {}
         self._decision_service = DecisionService(engine=RuleBasedDecisionEngine())
+        self._execution_service = ExecutionService()
 
     # --- lifecycle -----------------------------------------------------
 
@@ -227,12 +237,31 @@ class SimulationService:
         return decision
 
     async def execute_decision(self, decision_id: uuid.UUID) -> Decision:
-        """Updates decision state only — actual remediation is out of scope
-        for now (see the objective this was implemented under).
+        """Marks the decision executed, then hands it to ExecutionService to
+        actually begin remediation. Always returns the (now EXECUTED)
+        decision — a remediation that couldn't find a viable target is a
+        FAILED Execution record, not an HTTP error: the execute *call*
+        succeeded either way, see ExecutionService.start.
         """
-        decision, events = await self._decision_service.execute(decision_id)
-        await self._broadcast_decision_events(events)
+        decision, decision_events = await self._decision_service.execute(decision_id)
+        _, execution_events = await self._execution_service.start(
+            decision=decision,
+            racks=self.rack_states,
+            cluster_db_id=self.cluster_state.id,
+            scenario_db_id=self._scenario_db_ids.get(self._scenario_manager.active_key),
+            now=utcnow(),
+        )
+        await self._broadcast_decision_events(decision_events + execution_events)
         return decision
+
+    # --- executions (read access; started only via execute_decision) -------
+
+    @property
+    def all_executions(self) -> list[Execution]:
+        return self._execution_service.all_executions
+
+    def get_execution(self, execution_id: uuid.UUID) -> Execution | None:
+        return self._execution_service.get(execution_id)
 
     async def _broadcast_decision_events(self, events: list[Event]) -> None:
         """Immediate broadcast for a REST-triggered decision transition —
@@ -270,7 +299,8 @@ class SimulationService:
         if completed is not None:
             await self._emit_scenario_event(completed, kind="auto_complete")
 
-        drivers_by_rack = self._scenario_manager.compute_drivers(list(self._racks.values()), now)
+        scenario_drivers = self._scenario_manager.compute_drivers(list(self._racks.values()), now)
+        execution_drivers, execution_events = await self._execution_service.tick(now)
         active_scenario_db_id = self._scenario_db_ids.get(self._scenario_manager.active_key)
 
         drafts: list[EventDraft] = []
@@ -279,7 +309,15 @@ class SimulationService:
 
         for rack_id, previous in self._racks.items():
             internals = self._internals[rack_id]
-            drivers = drivers_by_rack.get(rack_id, NO_DRIVERS)
+            # An executed remediation influences the same physics tick a
+            # scenario does, through the exact same RackDrivers seam —
+            # combined here rather than one overriding the other, so a
+            # partially-effective remediation against an ongoing scenario
+            # is an emergent outcome, not a special case.
+            drivers = combine_drivers(
+                scenario_drivers.get(rack_id, NO_DRIVERS),
+                execution_drivers.get(rack_id, NO_DRIVERS),
+            )
             current, next_internals = compute_next_rack_state(previous, internals, self._rng, drivers)
             next_racks[rack_id] = current
             self._internals[rack_id] = next_internals
@@ -315,6 +353,7 @@ class SimulationService:
             now=now,
         )
         persisted.extend(decision_events)
+        persisted.extend(execution_events)
 
         events_payload = [EventRead.model_validate(event).model_dump(mode="json") for event in persisted]
         await self._broadcast(events_payload)
