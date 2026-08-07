@@ -59,3 +59,23 @@ class ClusterState:
     cooling_efficiency: float
     energy_savings: float
     prediction_confidence: float
+
+
+@dataclass(frozen=True)
+class RackDrivers:
+    """External bias applied to one rack's targets for a single physics tick.
+
+    This is the seam ScenarioManager uses to "influence the simulator
+    through inputs" (per design) without touching the physics engine's own
+    logic: every field defaults to a no-op, so a rack with no active
+    scenario influence behaves exactly as if RackDrivers didn't exist. The
+    physics engine folds these into targets it was already computing — it
+    gains no new branches per scenario.
+    """
+
+    gpu_bias: float = 0.0
+    cooling_ceiling: float | None = None
+    power_bias_kw: float = 0.0
+
+
+NO_DRIVERS = RackDrivers()

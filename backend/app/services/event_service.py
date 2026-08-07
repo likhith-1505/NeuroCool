@@ -41,6 +41,10 @@ class EventDraft:
     severity: EventSeverity
     title: str
     message: str
+    # Which scenario (if any) was active when this happened. Left for the
+    # caller to fill in (see app.simulation.engine) — detection here stays
+    # scenario-agnostic, it only knows about telemetry transitions.
+    scenario_id: uuid.UUID | None = None
 
 
 def detect_rack_events(cluster_id: uuid.UUID, previous: RackState, current: RackState) -> list[EventDraft]:
@@ -155,6 +159,7 @@ async def persist_events(db: AsyncSession, drafts: list[EventDraft]) -> list[Eve
         Event(
             cluster_id=draft.cluster_id,
             rack_id=draft.rack_id,
+            scenario_id=draft.scenario_id,
             severity=draft.severity,
             title=draft.title,
             message=draft.message,

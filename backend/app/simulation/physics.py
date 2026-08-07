@@ -31,7 +31,7 @@ import uuid
 from statistics import fmean
 
 from app.models.enums import RackStatus
-from app.simulation.state import ClusterState, RackInternals, RackState
+from app.simulation.state import NO_DRIVERS, ClusterState, RackDrivers, RackInternals, RackState
 
 # --- Tunable constants -------------------------------------------------
 # Kept in one place so the simulation's "feel" can be adjusted without
@@ -145,14 +145,25 @@ def compute_next_rack_state(
     previous: RackState,
     internals: RackInternals,
     rng: random.Random,
+    drivers: RackDrivers = NO_DRIVERS,
 ) -> tuple[RackState, RackInternals]:
     """Advance one rack by a single simulation tick. See module docstring
     for the causal chain this implements.
+
+    `drivers` is the ScenarioManager's only way to influence this: it can
+    bias the workload/power targets and cap the cooling target, but every
+    value is still *eased* toward its target exactly as before — the
+    scenario changes the destination, never the pace of travel, which is
+    what keeps transitions smooth regardless of which scenario is active.
     """
     # 1) Workload: only the *target* utilization is randomized, by a small
     #    bounded step, so gpu_utilization itself moves smoothly toward it.
+    #    A scenario's gpu_bias shifts that target directly (e.g. a thermal
+    #    spike's chosen rack gets a large positive bias).
     gpu_baseline = wander(internals.gpu_baseline, GPU_BASELINE_WANDER_STEP, 12.0, 92.0, rng)
-    gpu_target = clamp(gpu_baseline + rng.uniform(-GPU_JITTER_STEP, GPU_JITTER_STEP), 5.0, 100.0)
+    gpu_target = clamp(
+        gpu_baseline + rng.uniform(-GPU_JITTER_STEP, GPU_JITTER_STEP) + drivers.gpu_bias, 5.0, 100.0
+    )
     gpu_utilization = ease(previous.gpu_utilization, gpu_target, GPU_EASE_RATE)
 
     # 2) CPU load tracks GPU load loosely (scheduling/orchestration
@@ -160,11 +171,14 @@ def compute_next_rack_state(
     cpu_target = clamp(gpu_utilization * 0.55 + 12.0, 5.0, 100.0)
     cpu_utilization = ease(previous.cpu_utilization, cpu_target, CPU_EASE_RATE)
 
-    # 3) Power draw is a direct physical function of compute load.
+    # 3) Power draw is a direct physical function of compute load, plus a
+    #    scenario's own power_bias_kw (e.g. a power surge that isn't
+    #    driven by extra compute — a PSU/voltage event, not a GPU one).
     power_target = (
         IDLE_POWER_KW
         + (gpu_utilization / 100.0) * GPU_POWER_COEFFICIENT_KW
         + (cpu_utilization / 100.0) * CPU_POWER_COEFFICIENT_KW
+        + drivers.power_bias_kw
     )
     power_draw = ease(previous.power_draw, power_target, POWER_EASE_RATE)
 
@@ -178,12 +192,18 @@ def compute_next_rack_state(
     fan_speed = ease(previous.fan_speed, fan_target, FAN_EASE_RATE)
 
     # 5) Cooling efficiency responds to fan speed, with its own lag —
-    #    cooling capacity doesn't appear the instant fans spin up.
+    #    cooling capacity doesn't appear the instant fans spin up. A
+    #    cooling-failure scenario caps this target directly: fan_target
+    #    above is untouched (fans still visibly saturate trying to help),
+    #    but the efficiency they'd normally produce is capped regardless —
+    #    exactly modeling "the fans work, the cooling doesn't."
     cooling_target = clamp(
         BASE_COOLING_EFFICIENCY + (fan_speed - FAN_IDLE_SPEED) * COOLING_GAIN,
         30.0,
         99.0,
     )
+    if drivers.cooling_ceiling is not None:
+        cooling_target = min(cooling_target, drivers.cooling_ceiling)
     cooling_efficiency = ease(previous.cooling_efficiency, cooling_target, COOLING_EASE_RATE)
 
     # 6) Temperature rises with power draw and is tempered by cooling
