@@ -51,6 +51,66 @@ pre,
   to { stroke-dashoffset: 0; }
 }
 
+@keyframes rack-glow-pulse {
+  0%, 100% { opacity: 0; }
+  50% { opacity: 1; }
+}
+
+@keyframes rack-aura-pulse {
+  0%, 100% { opacity: 0.6; transform: scale(0.96); }
+  50% { opacity: 1; transform: scale(1.04); }
+}
+
+@keyframes rack-core-pulse {
+  0%, 100% { opacity: 0.62; }
+  50% { opacity: 0.94; }
+}
+
+@keyframes rack-critical-pulse {
+  0%, 100% { opacity: 0.35; transform: scale(1); }
+  50% { opacity: 0.62; transform: scale(1.04); }
+}
+
+@keyframes rack-ring-pulse-idle {
+  0%, 100% { transform: rotate(0deg); opacity: 0.62; }
+  50% { transform: rotate(10deg); opacity: 0.82; }
+}
+
+@keyframes rack-ring-pulse-selected {
+  0%, 100% { transform: rotate(0deg); opacity: 0.84; }
+  50% { transform: rotate(25deg); opacity: 1; }
+}
+
+@keyframes dock-glow-pulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+
+@keyframes metric-breathe {
+  0%, 100% { transform: translateY(0); opacity: 0.88; }
+  50% { transform: translateY(-1px); opacity: 1; }
+}
+
+@keyframes ribbon-glow-pulse {
+  0%, 100% { opacity: 0; }
+  50% { opacity: 1; }
+}
+
+@keyframes ribbon-streak {
+  from { transform: translateX(0%); }
+  to { transform: translateX(180%); }
+}
+
+@keyframes timeline-dot-active {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.2); }
+}
+
+@keyframes timeline-scan {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
+}
+
 .theme-light body {
   filter: saturate(0.92) brightness(1.04);
 }

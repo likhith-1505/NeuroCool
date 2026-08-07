@@ -69,11 +69,11 @@ export default function CommandPalette({ open, commands, onClose, onSelect }: Co
             onClick={onClose}
           />
           <motion.div
-            initial={{ opacity: 0, y: 16, scale: 0.98 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 10, scale: 0.99 }}
+            initial={{ opacity: 0, y: 16, scale: 0.98, x: "-50%" }}
+            animate={{ opacity: 1, y: 0, scale: 1, x: "-50%" }}
+            exit={{ opacity: 0, y: 10, scale: 0.99, x: "-50%" }}
             transition={{ duration: 0.24, ease: [0.2, 0.8, 0.2, 1] }}
-            className="fixed left-1/2 top-[18%] z-50 w-[min(46rem,92vw)] -translate-x-1/2 overflow-hidden rounded-2xl border border-white/10 bg-[linear-gradient(180deg,rgba(22,14,48,0.92),rgba(12,8,28,0.96))] shadow-[0_30px_80px_rgba(0,0,0,0.65)]"
+            className="fixed left-1/2 top-[18%] z-50 w-[min(46rem,92vw)] overflow-hidden rounded-2xl border border-white/10 bg-[linear-gradient(180deg,rgba(22,14,48,0.92),rgba(12,8,28,0.96))] shadow-[0_30px_80px_rgba(0,0,0,0.65)]"
           >
             <div className="border-b border-white/10 px-4 py-3">
               <input
@@ -104,7 +104,8 @@ export default function CommandPalette({ open, commands, onClose, onSelect }: Co
                       {active ? (
                         <motion.span
                           layoutId="palette-active"
-                          className="absolute inset-0 rounded-lg bg-violet-300/[0.16]"
+                          className="absolute inset-0 rounded-lg"
+                          style={{ background: "rgba(var(--accent-rgb),0.16)" }}
                           transition={{ type: "spring", stiffness: 420, damping: 35 }}
                         />
                       ) : null}

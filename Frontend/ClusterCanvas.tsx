@@ -25,6 +25,7 @@ type ClusterCanvasProps = {
   particleCount?: number;
   focusedRackId?: string;
   onRackFocus?: (rack: ClusterRack) => void;
+  tintColor?: string;
 };
 
 type Point = { x: number; y: number };
@@ -58,14 +59,55 @@ function getOrganicPosition(rack: ClusterRack, index: number, total: number): Po
   }
 
   const seed = hashToUnit(rack.id);
-  const t = (index + 0.8) / Math.max(total, 1);
-  const angle = Math.PI * 2 * t * 1.72 + seed * Math.PI * 0.58;
-  const radius = 12 + Math.sqrt(t) * 29 + (seed - 0.5) * 5;
+  // Evenly divide the circle across all racks first, then apply a small hash-based
+  // jitter for an organic (non-grid) feel — jitter is bounded well below the angular
+  // gap between neighbors so it can't swing two racks into each other.
+  const baseAngle = (Math.PI * 2 * index) / Math.max(total, 1);
+  const angle = baseAngle + (seed - 0.5) * (Math.PI / Math.max(total, 1)) * 0.7;
+  const radius = 30 + (seed - 0.5) * 10;
 
   return {
-    x: clamp(50 + Math.cos(angle) * radius * 1.08 + (seed - 0.5) * 8, 11, 89),
-    y: clamp(52 + Math.sin(angle) * radius * 0.84 + (0.5 - seed) * 6, 13, 87),
+    x: clamp(50 + Math.cos(angle) * radius * 1.08, 11, 89),
+    y: clamp(52 + Math.sin(angle) * radius * 0.84, 13, 87),
   };
+}
+
+/**
+ * Nudges apart any two points closer than minDistance so nodes never visually
+ * overlap, regardless of how many racks are on screen or how their hashed
+ * positions happen to land. Cheap (O(n^2) over a handful of racks) and runs once
+ * per layout, not per animation frame.
+ */
+function resolveCollisions(points: Map<string, Point>, minDistance: number): void {
+  const ids = [...points.keys()];
+  const iterations = 8;
+
+  for (let iter = 0; iter < iterations; iter += 1) {
+    let moved = false;
+
+    for (let i = 0; i < ids.length; i += 1) {
+      for (let j = i + 1; j < ids.length; j += 1) {
+        const a = points.get(ids[i])!;
+        const b = points.get(ids[j])!;
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const distance = Math.hypot(dx, dy);
+
+        if (distance < minDistance) {
+          moved = true;
+          const push = (minDistance - distance) / 2;
+          const nx = distance > 0.001 ? dx / distance : 1;
+          const ny = distance > 0.001 ? dy / distance : 0;
+          a.x = clamp(a.x - nx * push, 11, 89);
+          a.y = clamp(a.y - ny * push, 13, 87);
+          b.x = clamp(b.x + nx * push, 11, 89);
+          b.y = clamp(b.y + ny * push, 13, 87);
+        }
+      }
+    }
+
+    if (!moved) break;
+  }
 }
 
 export default function ClusterCanvas({
@@ -74,6 +116,7 @@ export default function ClusterCanvas({
   particleCount,
   focusedRackId,
   onRackFocus,
+  tintColor,
 }: ClusterCanvasProps) {
   const points = new Map<string, Point>();
   const rackById = new Map<string, ClusterRack>();
@@ -82,6 +125,8 @@ export default function ClusterCanvas({
     points.set(rack.id, getOrganicPosition(rack, index, racks.length));
     rackById.set(rack.id, rack);
   });
+
+  resolveCollisions(points, 26);
 
   const dedupe = new Set<string>();
   const links: Array<{ from: string; to: string }> = [];
@@ -118,7 +163,7 @@ export default function ClusterCanvas({
 
   return (
     <section
-      className={`relative isolate h-full min-h-[40rem] w-full overflow-hidden rounded-[2rem] bg-[radial-gradient(circle_at_18%_10%,rgba(146,92,255,0.28),transparent_36%),radial-gradient(circle_at_85%_24%,rgba(102,86,246,0.24),transparent_42%),radial-gradient(circle_at_58%_90%,rgba(83,130,255,0.16),transparent_46%),linear-gradient(170deg,#05030A_0%,#0A0618_52%,#130A2E_100%)] ${className ?? ""}`}
+      className={`relative isolate h-full min-h-[22rem] w-full overflow-hidden rounded-[2rem] bg-[radial-gradient(circle_at_18%_10%,rgba(146,92,255,0.28),transparent_36%),radial-gradient(circle_at_85%_24%,rgba(102,86,246,0.24),transparent_42%),radial-gradient(circle_at_58%_90%,rgba(83,130,255,0.16),transparent_46%),linear-gradient(170deg,#05030A_0%,#0A0618_52%,#130A2E_100%)] ${className ?? ""}`}
     >
       <style>{`
         @keyframes neurocool-nebula {
@@ -142,11 +187,38 @@ export default function ClusterCanvas({
           0%, 100% { opacity: 0.2; }
           50% { opacity: 0.52; }
         }
+
+        @keyframes neurocool-scan-sweep {
+          0% { transform: translate3d(0, -10%, 0); opacity: 0; }
+          8% { opacity: 0.5; }
+          92% { opacity: 0.5; }
+          100% { transform: translate3d(0, 110%, 0); opacity: 0; }
+        }
       `}</style>
+
+      {/* Faint scanline + sweep texture — signals "live monitoring feed" and is what
+          visually sets Mission Control apart from the Digital Twin's workspace grid. */}
+      <div
+        className="pointer-events-none absolute inset-0 opacity-[0.05] mix-blend-overlay [mask-image:radial-gradient(circle_at_center,black,transparent_92%)]"
+        style={{ backgroundImage: "repeating-linear-gradient(0deg, rgba(255,255,255,0.9) 0px, rgba(255,255,255,0.9) 1px, transparent 1px, transparent 3px)" }}
+      />
+      <div
+        className="pointer-events-none absolute inset-x-0 h-24"
+        style={{
+          background: "linear-gradient(180deg, rgba(180,155,255,0) 0%, rgba(180,155,255,0.1) 50%, rgba(180,155,255,0) 100%)",
+          animation: "neurocool-scan-sweep 10s linear infinite",
+        }}
+      />
 
       <div className="pointer-events-none absolute inset-0">
         <div className="absolute -left-40 -top-40 h-[36rem] w-[36rem] rounded-full bg-[radial-gradient(circle,rgba(146,104,255,0.34)_0%,rgba(146,104,255,0)_70%)] blur-3xl" style={{ animation: "neurocool-nebula 20s ease-in-out infinite alternate" }} />
         <div className="absolute -bottom-48 right-[-11rem] h-[35rem] w-[35rem] rounded-full bg-[radial-gradient(circle,rgba(96,132,255,0.24)_0%,rgba(96,132,255,0)_72%)] blur-3xl" style={{ animation: "neurocool-nebula 25s ease-in-out infinite alternate-reverse" }} />
+        {tintColor ? (
+          <div
+            className="absolute inset-0"
+            style={{ background: `radial-gradient(circle at 52% 42%, ${tintColor}, transparent 64%)`, transition: "background 1.4s ease" }}
+          />
+        ) : null}
         <div className="absolute inset-0 [mask-image:radial-gradient(circle_at_center,black,transparent_92%)]">
           {Array.from({ length: totalParticles }).map((_, index) => {
             const ax = hashToUnit(`ax-${index}`);
@@ -176,6 +248,16 @@ export default function ClusterCanvas({
             <stop offset="46%" stopColor="rgba(191,167,255,0.68)" />
             <stop offset="100%" stopColor="rgba(118,176,255,0.08)" />
           </linearGradient>
+          <radialGradient id="orb-glow" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stopColor="rgba(214,200,255,0.95)" />
+            <stop offset="45%" stopColor="rgba(214,200,255,0.45)" />
+            <stop offset="100%" stopColor="rgba(214,200,255,0)" />
+          </radialGradient>
+          <radialGradient id="orb-glow-focused" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stopColor="rgba(255,255,255,0.98)" />
+            <stop offset="45%" stopColor="rgba(255,255,255,0.55)" />
+            <stop offset="100%" stopColor="rgba(255,255,255,0)" />
+          </radialGradient>
         </defs>
 
         {links.map((link, index) => {
@@ -186,6 +268,8 @@ export default function ClusterCanvas({
           const rackA = rackById.get(link.from)!;
           const rackB = rackById.get(link.to)!;
           const intensity = clamp((rackA.gpuLoad + rackB.gpuLoad) / 200, 0.28, 1);
+          const linkedToFocused = focusedRackId != null && (link.from === focusedRackId || link.to === focusedRackId);
+          const pathId = `cluster-link-${link.from}-${link.to}`;
 
           const midX = (from.x + to.x) / 2;
           const midY = (from.y + to.y) / 2;
@@ -197,23 +281,32 @@ export default function ClusterCanvas({
           return (
             <g key={`${link.from}-${link.to}`}>
               <path
+                id={pathId}
                 d={path}
                 fill="none"
                 stroke="url(#energy-path)"
-                strokeWidth={0.24 + intensity * 0.12}
+                strokeWidth={linkedToFocused ? 0.36 + intensity * 0.12 : 0.24 + intensity * 0.12}
                 strokeLinecap="round"
-                opacity={0.2 + intensity * 0.1}
+                opacity={linkedToFocused ? 0.56 + intensity * 0.14 : 0.2 + intensity * 0.1}
                 style={{ animation: `neurocool-link-pulse ${2.8 + (index % 3) * 0.5}s ease-in-out ${index * -0.4}s infinite` }}
               />
               <path
                 d={path}
                 fill="none"
                 stroke="rgba(212,198,255,0.9)"
-                strokeWidth={0.08 + intensity * 0.08}
+                strokeWidth={linkedToFocused ? 0.13 + intensity * 0.08 : 0.08 + intensity * 0.08}
                 strokeDasharray="2.8 6.2"
                 strokeLinecap="round"
                 style={{ animation: `neurocool-flow ${1.9 + (index % 5) * 0.45}s linear ${index * -0.32}s infinite` }}
               />
+              <circle
+                r={linkedToFocused ? 1.1 : 0.85}
+                fill={linkedToFocused ? "url(#orb-glow-focused)" : "url(#orb-glow)"}
+              >
+                <animateMotion dur={`${2.6 + (index % 4) * 0.5}s`} begin={`${index * -0.4}s`} repeatCount="indefinite">
+                  <mpath xlinkHref={`#${pathId}`} />
+                </animateMotion>
+              </circle>
             </g>
           );
         })}

@@ -57,6 +57,13 @@ export default function RackNode({
   const isCritical = normalizedHealth < 45 || normalizedTemp >= 83;
   const tone = toneFromHealth(normalizedHealth);
 
+  const restShadow = selected
+    ? `0 0 0 1px rgba(255,255,255,0.28), 0 0 30px ${tone.glow}, 0 22px 46px rgba(5,3,12,0.6)`
+    : `0 0 0 1px rgba(255,255,255,0.11), 0 0 15px ${tone.glow}, 0 14px 32px rgba(5,3,12,0.5)`;
+  const peakShadow = selected
+    ? `0 0 0 1px rgba(255,255,255,0.38), 0 0 50px ${tone.glow}, 0 28px 62px rgba(5,3,12,0.68)`
+    : `0 0 0 1px rgba(255,255,255,0.17), 0 0 28px ${tone.glow}, 0 18px 42px rgba(5,3,12,0.58)`;
+
   return (
     <motion.button
       type="button"
@@ -70,75 +77,56 @@ export default function RackNode({
             }
       }
       whileTap={reduceMotion ? undefined : { scale: 0.992 }}
-      animate={
-        reduceMotion
-          ? undefined
-          : {
-              boxShadow: selected
-                ? [
-                    `0 0 0 1px rgba(255,255,255,0.28), 0 0 30px ${tone.glow}, 0 22px 46px rgba(5,3,12,0.6)`,
-                    `0 0 0 1px rgba(255,255,255,0.38), 0 0 50px ${tone.glow}, 0 28px 62px rgba(5,3,12,0.68)`,
-                    `0 0 0 1px rgba(255,255,255,0.28), 0 0 30px ${tone.glow}, 0 22px 46px rgba(5,3,12,0.6)`,
-                  ]
-                : [
-                    `0 0 0 1px rgba(255,255,255,0.11), 0 0 15px ${tone.glow}, 0 14px 32px rgba(5,3,12,0.5)`,
-                    `0 0 0 1px rgba(255,255,255,0.17), 0 0 28px ${tone.glow}, 0 18px 42px rgba(5,3,12,0.58)`,
-                    `0 0 0 1px rgba(255,255,255,0.11), 0 0 15px ${tone.glow}, 0 14px 32px rgba(5,3,12,0.5)`,
-                  ],
-            }
-      }
-      transition={{ duration: selected ? 2.2 : 3.4, repeat: Infinity, ease: "easeInOut" }}
+      style={{ boxShadow: restShadow }}
       className="group relative inline-flex h-[9.6rem] w-[9.6rem] items-center justify-center rounded-full border border-white/10 bg-[radial-gradient(circle_at_32%_24%,rgba(255,255,255,0.24),rgba(255,255,255,0.04)_38%,rgba(16,10,36,0.95)_70%)] backdrop-blur-2xl outline-none focus-visible:ring-2 focus-visible:ring-violet-300/65 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0a0618]"
       aria-pressed={selected}
       aria-label={`${rackName ?? "Rack node"} ${normalizedTemp.toFixed(1)} degrees Celsius`}
     >
-      <motion.span
+      <span
+        className="pointer-events-none absolute inset-0 rounded-full"
+        style={{
+          boxShadow: peakShadow,
+          opacity: 0,
+          animation: reduceMotion ? undefined : `rack-glow-pulse ${selected ? 2.2 : 3.4}s ease-in-out infinite`,
+        }}
+      />
+
+      <span
         className="pointer-events-none absolute -inset-4 rounded-full"
         style={{
           background: `radial-gradient(circle, ${tone.ambient} 0%, rgba(142,109,255,0) 68%)`,
           filter: "blur(12px)",
+          animation: reduceMotion ? undefined : "rack-aura-pulse 4.2s ease-in-out infinite",
         }}
-        animate={reduceMotion ? undefined : { opacity: [0.6, 1, 0.6], scale: [0.96, 1.04, 0.96] }}
-        transition={{ duration: 4.2, repeat: Infinity, ease: "easeInOut" }}
       />
 
-      <motion.span
+      <span
         className="absolute inset-[4px] rounded-full"
         style={{
           background: `conic-gradient(from -92deg, ${tone.ring} 0% ${normalizedHealth}%, rgba(255,255,255,0.11) ${normalizedHealth}% 100%)`,
+          animation: reduceMotion ? undefined : `${selected ? "rack-ring-pulse-selected 2.2s" : "rack-ring-pulse-idle 4.8s"} ease-in-out infinite`,
         }}
-        animate={
-          reduceMotion
-            ? undefined
-            : {
-                rotate: selected ? [0, 25, 0] : [0, 10, 0],
-                opacity: selected ? [0.84, 1, 0.84] : [0.62, 0.82, 0.62],
-              }
-        }
-        transition={{ duration: selected ? 2.2 : 4.8, repeat: Infinity, ease: "easeInOut" }}
       />
 
       <span className="absolute inset-[14px] rounded-full border border-white/10 bg-[radial-gradient(circle_at_52%_30%,rgba(255,255,255,0.2),rgba(255,255,255,0.04)_34%,rgba(8,6,22,0.95)_72%)]" />
 
-      <motion.span
+      <span
         className="pointer-events-none absolute inset-[22px] rounded-full"
         style={{
           background: `radial-gradient(circle, ${tone.core} 0%, rgba(122,99,255,0.16) 44%, rgba(122,99,255,0) 78%)`,
           filter: "blur(0.5px)",
+          animation: reduceMotion ? undefined : "rack-core-pulse 3s ease-in-out infinite",
         }}
-        animate={reduceMotion ? undefined : { opacity: [0.62, 0.94, 0.62] }}
-        transition={{ duration: 3, repeat: Infinity, ease: "easeInOut" }}
       />
 
       {isCritical ? (
-        <motion.span
+        <span
           className="pointer-events-none absolute -inset-2 rounded-full"
           style={{
             background: "radial-gradient(circle, rgba(255,126,160,0.18) 0%, rgba(255,126,160,0) 72%)",
             filter: "blur(8px)",
+            animation: reduceMotion ? undefined : "rack-critical-pulse 1.7s ease-in-out infinite",
           }}
-          animate={reduceMotion ? undefined : { scale: [1, 1.04, 1], opacity: [0.35, 0.62, 0.35] }}
-          transition={{ duration: 1.7, repeat: Infinity, ease: "easeInOut" }}
         />
       ) : null}
 
@@ -150,10 +138,10 @@ export default function RackNode({
       </div>
 
       <motion.div
-        className="pointer-events-none absolute -bottom-9 left-1/2 z-20 w-max min-w-[7.2rem] -translate-x-1/2 rounded-lg border border-white/12 bg-[#0d0920]/90 px-2.5 py-1.5 text-left backdrop-blur-xl"
+        className="pointer-events-none absolute -bottom-9 left-1/2 z-20 w-max min-w-[7.2rem] rounded-lg border border-white/12 bg-[#0d0920]/90 px-2.5 py-1.5 text-left backdrop-blur-xl"
         initial={false}
-        animate={{ opacity: selected ? 1 : 0, y: selected ? 0 : -4 }}
-        whileHover={{ opacity: 1, y: 0 }}
+        animate={{ opacity: selected ? 1 : 0, y: selected ? 0 : -4, x: "-50%" }}
+        whileHover={{ opacity: 1, y: 0, x: "-50%" }}
         transition={{ duration: 0.3, ease: [0.2, 0.8, 0.2, 1] }}
       >
         <p className="text-[0.54rem] uppercase tracking-[0.2em] text-white/52">{rackName ?? "Rack"}</p>
