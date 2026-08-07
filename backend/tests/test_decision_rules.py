@@ -9,7 +9,15 @@ import uuid
 from datetime import UTC, datetime
 
 from app.ai.base import DecisionContext
-from app.ai.rules import WARMUP_EVALUATIONS, RuleBasedDecisionEngine
+from app.ai.rules import (
+    MIGRATION_TEMPERATURE_C,
+    PROACTIVE_HORIZON_SECONDS,
+    PROACTIVE_MIN_CONFIDENCE,
+    PROACTIVE_TEMPERATURE_THRESHOLD_C,
+    WARMUP_EVALUATIONS,
+    RuleBasedDecisionEngine,
+)
+from app.forecasting.base import RackPrediction
 from app.models.enums import RackStatus
 from app.simulation.state import ClusterState, RackState
 
@@ -47,7 +55,11 @@ def _make_cluster(racks: list[RackState]) -> ClusterState:
 
 
 def _make_context(
-    racks: list[RackState], *, scenario_key: str = "normal", scenario_target_rack_id: uuid.UUID | None = None
+    racks: list[RackState],
+    *,
+    scenario_key: str = "normal",
+    scenario_target_rack_id: uuid.UUID | None = None,
+    forecasts: dict[uuid.UUID, list[RackPrediction]] | None = None,
 ) -> DecisionContext:
     return DecisionContext(
         cluster=_make_cluster(racks),
@@ -56,6 +68,21 @@ def _make_context(
         scenario_target_rack_id=scenario_target_rack_id,
         recent_events=[],
         now=datetime.now(UTC),
+        forecasts=forecasts or {},
+    )
+
+
+def _make_prediction(horizon_seconds: int, *, predicted_temperature: float, confidence: float) -> RackPrediction:
+    return RackPrediction(
+        horizon_seconds=horizon_seconds,
+        timestamp=datetime.now(UTC),
+        predicted_temperature=predicted_temperature,
+        predicted_gpu_utilization=80.0,
+        predicted_power=10.0,
+        predicted_health=70.0,
+        predicted_cooling=50.0,
+        predicted_risk=60.0,
+        confidence=confidence,
     )
 
 
@@ -283,3 +310,109 @@ def test_recommendations_are_identical_regardless_of_scenario_key() -> None:
     keys_normal = sorted(d.rule_key for d in drafts_normal)
     keys_other = sorted(d.rule_key for d in drafts_other)
     assert keys_normal == keys_other
+
+
+# --- proactive thermal risk (forecast-driven) -----------------------------
+
+
+def _pass_warmup(engine: RuleBasedDecisionEngine) -> None:
+    """The proactive rule shares the trend rules' warm-up gate (see
+    app.ai.rules — a forecast can carry the same kind of post-boot
+    settling noise a live trend can), so exercising it needs the engine
+    warmed up first, same as test_cooling_intervention_* above.
+    """
+    for _ in range(WARMUP_EVALUATIONS + 1):
+        engine.evaluate(_make_context([_make_rack(id=uuid.uuid4())]))
+
+
+def test_proactive_thermal_risk_fires_when_forecast_crosses_threshold() -> None:
+    """The 74°C -> 88°C-in-5-minutes example from the objective: currently
+    safe, but the 300s forecast crosses PROACTIVE_TEMPERATURE_THRESHOLD_C
+    at high confidence.
+    """
+    engine = RuleBasedDecisionEngine()
+    _pass_warmup(engine)
+    rack = _make_rack(temperature=74.0, gpu_utilization=70.0)
+    forecasts = {
+        rack.id: [
+            _make_prediction(30, predicted_temperature=76.0, confidence=90.0),
+            _make_prediction(300, predicted_temperature=88.0, confidence=70.0),
+        ]
+    }
+    drafts = engine.evaluate(_make_context([rack], forecasts=forecasts))
+
+    matches = [d for d in drafts if d.rule_key == f"proactive_thermal_risk:{rack.id}"]
+    assert len(matches) == 1
+    assert matches[0].affected_racks == [rack.id]
+    assert matches[0].confidence == 70.0
+    assert "proactiv" in matches[0].recommended_action.lower()
+
+
+def test_proactive_thermal_risk_does_not_fire_when_forecast_stays_safe() -> None:
+    engine = RuleBasedDecisionEngine()
+    _pass_warmup(engine)
+    rack = _make_rack(temperature=74.0)
+    forecasts = {
+        rack.id: [_make_prediction(300, predicted_temperature=79.0, confidence=90.0)]  # below threshold
+    }
+    drafts = engine.evaluate(_make_context([rack], forecasts=forecasts))
+    assert not any(d.rule_key.startswith("proactive_thermal_risk") for d in drafts)
+
+
+def test_proactive_thermal_risk_does_not_fire_below_confidence_floor() -> None:
+    engine = RuleBasedDecisionEngine()
+    _pass_warmup(engine)
+    rack = _make_rack(temperature=74.0)
+    forecasts = {
+        rack.id: [
+            _make_prediction(
+                PROACTIVE_HORIZON_SECONDS,
+                predicted_temperature=PROACTIVE_TEMPERATURE_THRESHOLD_C + 5.0,
+                confidence=PROACTIVE_MIN_CONFIDENCE - 1.0,
+            )
+        ]
+    }
+    drafts = engine.evaluate(_make_context([rack], forecasts=forecasts))
+    assert not any(d.rule_key.startswith("proactive_thermal_risk") for d in drafts)
+
+
+def test_proactive_thermal_risk_does_not_fire_once_already_in_reactive_territory() -> None:
+    """Once the rack is already past MIGRATION_TEMPERATURE_C, the reactive
+    workload_migration rule owns the recommendation — no duplicate from
+    the proactive rule.
+    """
+    engine = RuleBasedDecisionEngine()
+    _pass_warmup(engine)
+    rack = _make_rack(temperature=MIGRATION_TEMPERATURE_C + 1.0, gpu_utilization=95.0)
+    forecasts = {
+        rack.id: [_make_prediction(PROACTIVE_HORIZON_SECONDS, predicted_temperature=95.0, confidence=90.0)]
+    }
+    drafts = engine.evaluate(_make_context([rack], forecasts=forecasts))
+    assert not any(d.rule_key.startswith("proactive_thermal_risk") for d in drafts)
+    assert any(d.rule_key.startswith("workload_migration") for d in drafts)
+
+
+def test_proactive_thermal_risk_does_not_fire_without_a_matching_horizon() -> None:
+    engine = RuleBasedDecisionEngine()
+    _pass_warmup(engine)
+    rack = _make_rack(temperature=74.0)
+    forecasts = {
+        rack.id: [_make_prediction(30, predicted_temperature=95.0, confidence=90.0)]  # wrong horizon only
+    }
+    drafts = engine.evaluate(_make_context([rack], forecasts=forecasts))
+    assert not any(d.rule_key.startswith("proactive_thermal_risk") for d in drafts)
+
+
+def test_proactive_thermal_risk_stays_quiet_during_warmup_even_with_a_confident_forecast() -> None:
+    """Mirrors test_cooling_intervention_stays_quiet_during_warmup_even_
+    with_a_sharp_change: a freshly booted engine shouldn't act on a
+    forecast either, no matter how confident it claims to be, until the
+    warm-up window has passed.
+    """
+    engine = RuleBasedDecisionEngine()
+    rack = _make_rack(temperature=74.0)
+    forecasts = {
+        rack.id: [_make_prediction(PROACTIVE_HORIZON_SECONDS, predicted_temperature=90.0, confidence=90.0)]
+    }
+    drafts = engine.evaluate(_make_context([rack], forecasts=forecasts))
+    assert not any(d.rule_key.startswith("proactive_thermal_risk") for d in drafts)

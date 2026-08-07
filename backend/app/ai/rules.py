@@ -14,6 +14,14 @@ class, not in DecisionContext — it's an implementation detail of *this*
 reasoning strategy. An LLM engine might infer trends from a longer history
 window instead; the shared contract (app.ai.base) doesn't need to know
 either way.
+
+One rule, _rule_proactive_thermal_risk, reasons from ForecastService's
+output instead of only current telemetry (context.forecasts — see
+app.forecasting) — "current temperature 74°C, forecast 88°C in 5 minutes"
+generating a recommendation before the reactive threshold is ever crossed,
+per the objective. It stays consistent with every other rule here: no
+scenario awareness, just numbers — the forecast's own confidence carries
+through untouched rather than being re-fabricated.
 """
 
 from __future__ import annotations
@@ -21,12 +29,16 @@ from __future__ import annotations
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from app.ai.base import DecisionContext, DecisionDraft
 from app.models.enums import EventSeverity
 from app.services.event_service import POWER_SPIKE_DELTA_KW
 from app.simulation.physics import COMFORTABLE_TEMPERATURE_C, clamp
 from app.simulation.state import ClusterState, RackState
+
+if TYPE_CHECKING:
+    from app.forecasting.base import RackPrediction
 
 # --- Rule thresholds -------------------------------------------------------
 
@@ -47,6 +59,13 @@ REBALANCE_TEMPERATURE_THRESHOLD_C = 78.0
 REBALANCE_MIN_RACKS = 2
 
 DELAY_JOBS_POWER_DELTA_KW = POWER_SPIKE_DELTA_KW  # reuse event_service's definition of "a spike"
+
+# Proactive rule: look PROACTIVE_HORIZON_SECONDS ahead (the objective's own
+# "5 minutes" example) and recommend migration before the reactive
+# MIGRATION_TEMPERATURE_C threshold is ever actually crossed live.
+PROACTIVE_HORIZON_SECONDS = 300
+PROACTIVE_TEMPERATURE_THRESHOLD_C = 85.0
+PROACTIVE_MIN_CONFIDENCE = 40.0  # don't act on a low-confidence long-horizon guess
 
 
 @dataclass
@@ -95,6 +114,19 @@ class RuleBasedDecisionEngine:
             if migration is not None:
                 drafts.append(migration)
 
+            # Gated by the same warm-up window as the trend-based rules
+            # below: right after boot, ForecastService's own trend fit is
+            # working off only a handful of samples and can extrapolate a
+            # misleadingly confident-looking spike from ordinary settling
+            # noise (see ForecastService.EVENT_MIN_CONFIDENCE's docstring
+            # for the same issue on the forecasting side) — so a forecast
+            # alone isn't enough to justify acting on before the engine has
+            # otherwise proven itself past warm-up.
+            if past_warmup:
+                proactive = self._rule_proactive_thermal_risk(rack, context.forecasts.get(rack.id, []))
+                if proactive is not None:
+                    drafts.append(proactive)
+
             if trend is not None and past_warmup:
                 if len(trend.window) >= COOLING_TREND_WINDOW_TICKS:
                     baseline_temperature, baseline_cooling = trend.window[0]
@@ -139,7 +171,44 @@ class RuleBasedDecisionEngine:
             recommended_action=f"Migrate a portion of {rack.name}'s workload to a cooler rack.",
             confidence=_confidence_from_margin(rack.temperature, MIGRATION_TEMPERATURE_C, 15.0),
             affected_racks=[rack.id],
-            expected_temperature_reduction=_estimate_temperature_relief(rack),
+            expected_temperature_reduction=_estimate_temperature_relief(rack.temperature),
+        )
+
+    @staticmethod
+    def _rule_proactive_thermal_risk(rack: RackState, forecasts: list["RackPrediction"]) -> DecisionDraft | None:
+        """IF the current reading is still safe BUT the forecast for
+        PROACTIVE_HORIZON_SECONDS ahead crosses PROACTIVE_TEMPERATURE_
+        THRESHOLD_C (at reasonable confidence) THEN recommend proactive
+        migration — before the reactive workload_migration rule's live
+        threshold is ever crossed. This is the Decision Engine "using
+        forecasted telemetry" the objective asks for, directly.
+        """
+        if rack.temperature > MIGRATION_TEMPERATURE_C:
+            return None  # already reactive-rule territory; don't double-recommend
+
+        forecast = next((f for f in forecasts if f.horizon_seconds == PROACTIVE_HORIZON_SECONDS), None)
+        if forecast is None:
+            return None
+        if forecast.predicted_temperature <= PROACTIVE_TEMPERATURE_THRESHOLD_C:
+            return None
+        if forecast.confidence < PROACTIVE_MIN_CONFIDENCE:
+            return None
+
+        minutes = PROACTIVE_HORIZON_SECONDS // 60
+        return DecisionDraft(
+            rule_key=f"proactive_thermal_risk:{rack.id}",
+            severity=EventSeverity.WARNING,
+            title=f"Proactive migration recommended for {rack.name}",
+            reasoning=(
+                f"{rack.name} is currently {rack.temperature:.1f}°C, but the {minutes}-minute forecast "
+                f"projects {forecast.predicted_temperature:.1f}°C ({forecast.confidence:.0f}% confidence) "
+                f"— above the {PROACTIVE_TEMPERATURE_THRESHOLD_C:.0f}°C threshold. Acting now avoids "
+                f"waiting for the threshold to actually be crossed."
+            ),
+            recommended_action=f"Proactively migrate a portion of {rack.name}'s workload before it overheats.",
+            confidence=forecast.confidence,  # inherit the forecast's own confidence — honest, not re-fabricated
+            affected_racks=[rack.id],
+            expected_temperature_reduction=_estimate_temperature_relief(forecast.predicted_temperature),
         )
 
     @staticmethod
@@ -170,7 +239,7 @@ class RuleBasedDecisionEngine:
                 rack.temperature - baseline_temperature, TEMPERATURE_RISE_THRESHOLD_C, 3.0
             ),
             affected_racks=[rack.id],
-            expected_temperature_reduction=_estimate_temperature_relief(rack),
+            expected_temperature_reduction=_estimate_temperature_relief(rack.temperature),
         )
 
     @staticmethod
@@ -238,12 +307,15 @@ def _confidence_from_margin(value: float, threshold: float, span: float) -> floa
     return round(clamp(55.0 + (margin / span) * 40.0, 55.0, 98.0), 1)
 
 
-def _estimate_temperature_relief(rack: RackState) -> float:
+def _estimate_temperature_relief(temperature: float) -> float:
     """An honest, derived estimate rather than a fabricated number:
     intervention typically claws back roughly a third of the excess above
-    the comfortable baseline the physics engine itself targets.
+    the comfortable baseline the physics engine itself targets. Takes a
+    plain temperature (not a RackState) so the proactive rule can pass a
+    *forecast's* predicted temperature — the excess it's avoiding, not the
+    rack's current one.
     """
-    excess = max(0.0, rack.temperature - COMFORTABLE_TEMPERATURE_C)
+    excess = max(0.0, temperature - COMFORTABLE_TEMPERATURE_C)
     return round(excess * 0.35, 1)
 
 

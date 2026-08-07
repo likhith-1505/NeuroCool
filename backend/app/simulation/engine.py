@@ -26,6 +26,14 @@ execute_decision. Every tick, its RackDrivers contribution is combined
 (see combine_drivers) with the scenario's and fed into the exact same
 physics call — an executed remediation is just another input the physics
 engine already knew how to accept, never a special-cased temperature write.
+
+Forecasting runs alongside the simulation the same way: this class owns a
+ForecastService (see app.forecasting.service), fed this tick's post-physics
+racks every tick, *before* DecisionService.evaluate — so the Decision
+Engine consumes the freshest predictions as a plain argument, the same way
+it already consumes ClusterState/RackState. The forecasting and decision
+engines otherwise stay independent — this class is the only place that
+calls both.
 """
 
 from __future__ import annotations
@@ -45,6 +53,9 @@ from app.ai.service import DecisionService
 from app.config import settings
 from app.db.session import AsyncSessionLocal
 from app.execution.service import ExecutionService
+from app.forecasting.base import RackPrediction
+from app.forecasting.service import ForecastService
+from app.forecasting.trend import TrendForecastEngine
 from app.models.cluster import Cluster
 from app.models.decision import Decision
 from app.models.enums import EventSeverity, RackStatus
@@ -118,6 +129,7 @@ class SimulationService:
         self._scenario_db_ids: dict[str, uuid.UUID] = {}
         self._decision_service = DecisionService(engine=RuleBasedDecisionEngine())
         self._execution_service = ExecutionService()
+        self._forecast_service = ForecastService(engine=TrendForecastEngine())
 
     # --- lifecycle -----------------------------------------------------
 
@@ -263,6 +275,19 @@ class SimulationService:
     def get_execution(self, execution_id: uuid.UUID) -> Execution | None:
         return self._execution_service.get(execution_id)
 
+    # --- forecasts (read access; recomputed every tick) ---------------------
+
+    @property
+    def cluster_forecast(self) -> list[RackPrediction]:
+        return self._forecast_service.cluster_forecast
+
+    @property
+    def rack_forecasts(self) -> dict[uuid.UUID, list[RackPrediction]]:
+        return self._forecast_service.rack_forecasts
+
+    def rack_forecast(self, rack_id: uuid.UUID) -> list[RackPrediction]:
+        return self._forecast_service.rack_forecast(rack_id)
+
     async def _broadcast_decision_events(self, events: list[Event]) -> None:
         """Immediate broadcast for a REST-triggered decision transition —
         the tick loop's regular broadcast already covers decisions that
@@ -340,9 +365,23 @@ class SimulationService:
             for event in persisted:
                 logger.info("Event: [%s] %s", event.severity.value, event.title)
 
+        # Forecasting runs before decisions so DecisionService can consume
+        # the freshest predictions this same tick — the Decision Engine
+        # reasons over "current telemetry + forecast", not current
+        # telemetry alone. The two engines otherwise never talk to each
+        # other directly (see app.forecasting.service's module docstring).
+        forecast_events = await self._forecast_service.tick(
+            racks=list(self._racks.values()),
+            scenario_key=self._scenario_manager.active_key,
+            cluster_id=cluster_id,
+            scenario_db_id=active_scenario_db_id,
+            now=now,
+        )
+        persisted.extend(forecast_events)
+
         # The DecisionEngine evaluates every tick, exactly like the physics
-        # step — it only ever sees the resulting telemetry, never which
-        # scenario (if any) produced it.
+        # step — it only ever sees the resulting telemetry (and now the
+        # forecast), never which scenario (if any) produced it.
         decision_events = await self._decision_service.evaluate(
             cluster=self._cluster,
             racks=list(self._racks.values()),
@@ -351,6 +390,7 @@ class SimulationService:
             cluster_db_id=cluster_id,
             scenario_db_id=active_scenario_db_id,
             now=now,
+            forecasts=self._forecast_service.rack_forecasts,
         )
         persisted.extend(decision_events)
         persisted.extend(execution_events)

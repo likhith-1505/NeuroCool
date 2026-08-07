@@ -27,7 +27,7 @@ from datetime import datetime
 from typing import Literal
 
 from app.simulation.physics import clamp
-from app.simulation.state import RackDrivers, RackState
+from app.simulation.state import RackDrivers, RackState, ring_neighbors
 from app.utils.time import utcnow
 
 TransitionState = Literal["transitioning", "steady"]
@@ -275,19 +275,4 @@ class ScenarioManager:
             return None, frozenset()
 
         target = self._rng.choice(racks)
-        return target.id, self._ring_neighbors(target.id, racks)
-
-    @staticmethod
-    def _ring_neighbors(rack_id: uuid.UUID, racks: list[RackState]) -> frozenset[uuid.UUID]:
-        """Racks are treated as a simple ring in seed order; "nearby" means
-        adjacent in that ring. This mirrors the frontend's digital twin,
-        which likewise treats racks as loosely connected neighbors rather
-        than modeling real physical placement.
-        """
-        ids = [rack.id for rack in racks]
-        if rack_id not in ids or len(ids) < 2:
-            return frozenset()
-        index = ids.index(rack_id)
-        neighbors = {ids[(index - 1) % len(ids)], ids[(index + 1) % len(ids)]}
-        neighbors.discard(rack_id)
-        return frozenset(neighbors)
+        return target.id, ring_neighbors(target.id, racks)

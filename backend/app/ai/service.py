@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,6 +35,9 @@ from app.models.enums import DecisionStatus, EventSeverity
 from app.models.event import Event
 from app.services.event_service import EventDraft, persist_events
 from app.simulation.state import ClusterState, RackState
+
+if TYPE_CHECKING:
+    from app.forecasting.base import RackPrediction
 
 logger = logging.getLogger(__name__)
 
@@ -80,12 +84,17 @@ class DecisionService:
         cluster_db_id: uuid.UUID,
         scenario_db_id: uuid.UUID | None,
         now: datetime,
+        forecasts: dict[uuid.UUID, list["RackPrediction"]] | None = None,
     ) -> list[Event]:
         """Evaluate the cluster, upsert (dedupe/update) active decisions,
         and expire stale ones. Returns the lifecycle events raised this
         call (Created / Expired) for the caller to fold into its own
         broadcast — confidence-only updates raise no event, see module
         docstring.
+
+        `forecasts` is ForecastService's latest output (see
+        app.forecasting) — optional and defaulted so this stays callable
+        exactly as before anywhere forecasts aren't available yet.
         """
         async with AsyncSessionLocal() as db:
             recent_events = await self._recent_events(db)
@@ -96,6 +105,7 @@ class DecisionService:
                 scenario_target_rack_id=scenario_target_rack_id,
                 recent_events=recent_events,
                 now=now,
+                forecasts=forecasts or {},
             )
             drafts = self._engine.evaluate(context)
 

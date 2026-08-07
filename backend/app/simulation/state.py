@@ -90,6 +90,24 @@ class RackDrivers:
 NO_DRIVERS = RackDrivers()
 
 
+def ring_neighbors(rack_id: uuid.UUID, racks: list[RackState]) -> frozenset[uuid.UUID]:
+    """Racks are treated as a simple ring in list order; "nearby" means
+    adjacent in that ring. This mirrors the frontend's digital twin, which
+    likewise treats racks as loosely connected neighbors rather than
+    modeling real physical placement. Shared by ScenarioManager (which
+    rack to lean on for a single-rack incident's secondary effect) and
+    ForecastEngine implementations (a factor in the neighbour-influence
+    part of thermal risk) — one topology notion, not two.
+    """
+    ids = [rack.id for rack in racks]
+    if rack_id not in ids or len(ids) < 2:
+        return frozenset()
+    index = ids.index(rack_id)
+    neighbors = {ids[(index - 1) % len(ids)], ids[(index + 1) % len(ids)]}
+    neighbors.discard(rack_id)
+    return frozenset(neighbors)
+
+
 def combine_drivers(*drivers: RackDrivers) -> RackDrivers:
     """Merge multiple RackDrivers acting on the same rack into one: bias
     fields add together, cooling_ceiling takes the most restrictive (lowest)

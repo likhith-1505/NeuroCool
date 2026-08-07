@@ -25,6 +25,7 @@ from app.models.enums import EventSeverity
 from app.simulation.state import ClusterState, RackState
 
 if TYPE_CHECKING:
+    from app.forecasting.base import RackPrediction
     from app.models.event import Event
 
 
@@ -35,7 +36,11 @@ class DecisionContext:
     Bundled into one object so the DecisionEngine Protocol's signature
     stays stable even if what an engine needs to know grows later (e.g. an
     LLM engine wanting a longer history) — new fields get added here, not
-    threaded through every engine's method signature.
+    threaded through every engine's method signature. `forecasts` is the
+    latest example: the Decision Engine now consumes ForecastService's
+    output (see app.forecasting) to reason proactively, but the two
+    engines stay independent — this module never imports app.forecasting
+    at runtime, only under TYPE_CHECKING for the annotation.
     """
 
     cluster: ClusterState
@@ -44,6 +49,7 @@ class DecisionContext:
     scenario_target_rack_id: uuid.UUID | None
     recent_events: list["Event"]
     now: datetime
+    forecasts: dict[uuid.UUID, list["RackPrediction"]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

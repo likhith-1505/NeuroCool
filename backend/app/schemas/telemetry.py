@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from app.schemas.cluster import ClusterTelemetry
 from app.schemas.decision import DecisionRead
+from app.schemas.forecast import ClusterForecastRead, ForecastPoint, RackForecastRead
 from app.schemas.rack import RackTelemetry
 from app.schemas.scenario import ScenarioStatus
 from app.utils.time import utcnow
@@ -23,6 +24,8 @@ class TelemetrySnapshot(BaseModel):
     racks: list[RackTelemetry]
     scenario: ScenarioStatus
     decisions: list[DecisionRead]
+    forecast: ClusterForecastRead
+    rack_forecasts: list[RackForecastRead]
 
     @classmethod
     def from_simulation(cls, simulation: "SimulationService", timestamp: datetime | None = None) -> "TelemetrySnapshot":
@@ -31,10 +34,12 @@ class TelemetrySnapshot(BaseModel):
         Shared by the WebSocket endpoint (initial snapshot on connect), the
         simulation engine (per-tick broadcast), and scenario/decision
         changes (immediate broadcast) — one place that knows how to turn
-        engine state into this payload shape. Active decisions are always
-        included here (not a separate message type), which is also what
-        makes a confidence-only decision update visible on the very next
-        regular tick without any special-cased broadcast path.
+        engine state into this payload shape. Active decisions and the
+        latest forecast are always included here (not separate message
+        types), which is also what makes a confidence-only update visible
+        on the very next regular tick without any special-cased broadcast
+        path — "current state, prediction, risk, confidence" together,
+        every tick, per the objective.
         """
         return cls(
             timestamp=timestamp or utcnow(),
@@ -42,4 +47,15 @@ class TelemetrySnapshot(BaseModel):
             racks=[RackTelemetry.model_validate(rack) for rack in simulation.rack_states],
             scenario=simulation.scenario_status,
             decisions=[DecisionRead.model_validate(d) for d in simulation.active_decisions],
+            forecast=ClusterForecastRead(
+                predictions=[ForecastPoint.model_validate(p) for p in simulation.cluster_forecast]
+            ),
+            rack_forecasts=[
+                RackForecastRead(
+                    rack_id=rack.id,
+                    rack_name=rack.name,
+                    predictions=[ForecastPoint.model_validate(p) for p in simulation.rack_forecasts.get(rack.id, [])],
+                )
+                for rack in simulation.rack_states
+            ],
         )

@@ -36,6 +36,10 @@ _ACTION_BY_RULE_PREFIX: dict[str, ExecutionActionType] = {
     "cooling_intervention": ExecutionActionType.COOLING_ADJUSTMENT,
     "delay_new_jobs": ExecutionActionType.JOB_DELAY,
     "cluster_rebalance": ExecutionActionType.CLUSTER_REBALANCE,
+    # A proactive recommendation (see app.ai.rules) is the same remediation
+    # as a reactive workload_migration, just triggered earlier from a
+    # forecast instead of live telemetry — same action, different trigger.
+    "proactive_thermal_risk": ExecutionActionType.WORKLOAD_MIGRATION,
 }
 
 # Event raised when an action reaches full effect (ramp-in complete).
