@@ -11,6 +11,7 @@ build/
 .env.development.local
 .env.test.local
 .env.production.local
+# (.env.example is intentionally NOT ignored — it's committed documentation)
 
 # Logs
 logs/
@@ -53,3 +54,19 @@ coverage/
 # pnpm-lock.yaml
 
 # If using npm, DO NOT ignore package-lock.json
+
+# --- Backend (Python) ---
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Backend local database/cache volumes (only relevant if bind-mounted;
+# the default docker-compose.yml uses named Docker volumes instead)
+postgres_data/
+redis_data/
