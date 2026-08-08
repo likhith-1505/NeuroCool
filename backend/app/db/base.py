@@ -6,6 +6,7 @@ that autogenerate can see the complete schema.
 
 from app.db.base_class import Base
 from app.models.cluster import Cluster
+from app.models.conversation import Conversation, ConversationMessage
 from app.models.decision import Decision
 from app.models.event import Event
 from app.models.execution import Execution
@@ -24,4 +25,6 @@ __all__ = [
     "Decision",
     "Execution",
     "OptimizationPlan",
+    "Conversation",
+    "ConversationMessage",
 ]

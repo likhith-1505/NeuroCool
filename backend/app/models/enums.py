@@ -55,3 +55,12 @@ class ExecutionStatus(str, enum.Enum):
 class OptimizationPlanStatus(str, enum.Enum):
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class ConversationRole(str, enum.Enum):
+    """Who authored one ConversationMessage — see app.models.conversation
+    and app.neurocore.
+    """
+
+    USER = "user"
+    ASSISTANT = "assistant"
