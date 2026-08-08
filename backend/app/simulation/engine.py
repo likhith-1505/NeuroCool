@@ -34,6 +34,15 @@ Engine consumes the freshest predictions as a plain argument, the same way
 it already consumes ClusterState/RackState. The forecasting and decision
 engines otherwise stay independent — this class is the only place that
 calls both.
+
+The Optimization Engine sits between the two: this class also owns an
+OptimizationService (see app.optimization.service), ticked every cycle
+right after ForecastService and *before* DecisionService.evaluate, fed the
+same forecasts plus recent events. DecisionService consumes its plans
+instead of reading forecasts directly (see app.ai.rules._rule_from_
+optimization_plan) — every recommendation the Decision Engine now makes
+from a forecast-driven trigger has already been through candidate
+generation, physics-based simulation, and scoring first.
 """
 
 from __future__ import annotations
@@ -61,8 +70,11 @@ from app.models.decision import Decision
 from app.models.enums import EventSeverity, RackStatus
 from app.models.event import Event
 from app.models.execution import Execution
+from app.models.optimization_plan import OptimizationPlan
 from app.models.rack import Rack
 from app.models.scenario import Scenario
+from app.optimization.planner import SimulationOptimizer
+from app.optimization.service import OptimizationService
 from app.schemas.event import EventRead
 from app.schemas.scenario import ScenarioStatus
 from app.schemas.telemetry import TelemetrySnapshot
@@ -130,6 +142,7 @@ class SimulationService:
         self._decision_service = DecisionService(engine=RuleBasedDecisionEngine())
         self._execution_service = ExecutionService()
         self._forecast_service = ForecastService(engine=TrendForecastEngine())
+        self._optimization_service = OptimizationService(engine=SimulationOptimizer(tick_seconds=self.tick_seconds))
 
     # --- lifecycle -----------------------------------------------------
 
@@ -288,6 +301,24 @@ class SimulationService:
     def rack_forecast(self, rack_id: uuid.UUID) -> list[RackPrediction]:
         return self._forecast_service.rack_forecast(rack_id)
 
+    # --- optimization plans (read access) -----------------------------------
+
+    @property
+    def active_plans(self) -> list[OptimizationPlan]:
+        """Plans whose trigger is still active — what TelemetrySnapshot exposes."""
+        return self._optimization_service.active_plans
+
+    @property
+    def all_plans(self) -> list[OptimizationPlan]:
+        return self._optimization_service.all_plans
+
+    @property
+    def latest_plan(self) -> OptimizationPlan | None:
+        return self._optimization_service.latest_plan
+
+    def get_plan(self, plan_id: uuid.UUID) -> OptimizationPlan | None:
+        return self._optimization_service.get(plan_id)
+
     async def _broadcast_decision_events(self, events: list[Event]) -> None:
         """Immediate broadcast for a REST-triggered decision transition —
         the tick loop's regular broadcast already covers decisions that
@@ -379,9 +410,25 @@ class SimulationService:
         )
         persisted.extend(forecast_events)
 
+        # Optimization runs after forecasting and before decisions, for the
+        # same reason: DecisionService should consume this tick's freshest
+        # plans, not last tick's (see app.optimization.service's module
+        # docstring for why plans are dedup'd/refreshed in place instead of
+        # persisting a new row every tick a trigger keeps holding).
+        plans_by_rack, optimization_events = await self._optimization_service.tick(
+            cluster=self._cluster,
+            racks=list(self._racks.values()),
+            scenario_key=self._scenario_manager.active_key,
+            forecasts=self._forecast_service.rack_forecasts,
+            cluster_db_id=cluster_id,
+            scenario_db_id=active_scenario_db_id,
+            now=now,
+        )
+        persisted.extend(optimization_events)
+
         # The DecisionEngine evaluates every tick, exactly like the physics
         # step — it only ever sees the resulting telemetry (and now the
-        # forecast), never which scenario (if any) produced it.
+        # optimization plans), never which scenario (if any) produced it.
         decision_events = await self._decision_service.evaluate(
             cluster=self._cluster,
             racks=list(self._racks.values()),
@@ -390,7 +437,7 @@ class SimulationService:
             cluster_db_id=cluster_id,
             scenario_db_id=active_scenario_db_id,
             now=now,
-            forecasts=self._forecast_service.rack_forecasts,
+            plans=plans_by_rack,
         )
         persisted.extend(decision_events)
         persisted.extend(execution_events)

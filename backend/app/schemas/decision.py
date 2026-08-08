@@ -24,4 +24,10 @@ class DecisionRead(BaseModel):
     confidence: float
     affected_racks: list[uuid.UUID]
     affected_jobs: list = Field(default_factory=list)  # placeholder — no Job model exists yet
+    # The OptimizationPlan this decision was derived from, if any — see
+    # app.optimization. Full candidate/score detail lives at
+    # GET /api/plans/{plan_id}; alternative_actions below is the compact
+    # "Alternative 1 / Alternative 2 / reason for rejection" summary.
+    plan_id: uuid.UUID | None = None
+    alternative_actions: list = Field(default_factory=list)
     status: DecisionStatus

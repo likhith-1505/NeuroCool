@@ -15,13 +15,16 @@ reasoning strategy. An LLM engine might infer trends from a longer history
 window instead; the shared contract (app.ai.base) doesn't need to know
 either way.
 
-One rule, _rule_proactive_thermal_risk, reasons from ForecastService's
-output instead of only current telemetry (context.forecasts — see
-app.forecasting) — "current temperature 74°C, forecast 88°C in 5 minutes"
+One rule, _rule_from_optimization_plan, reasons from the Optimization
+Engine's output instead of only current telemetry (context.plans — see
+app.optimization) — "current temperature 74°C, forecast 88°C in 5 minutes"
 generating a recommendation before the reactive threshold is ever crossed,
-per the objective. It stays consistent with every other rule here: no
-scenario awareness, just numbers — the forecast's own confidence carries
-through untouched rather than being re-fabricated.
+per the original forecasting objective this rule now builds on. It stays
+consistent with every other rule here: no scenario awareness, just
+numbers — a plan's winning candidate score/confidence carries through
+untouched rather than being re-fabricated, and its runner-up candidates
+become the recommendation's "Alternative 1 / Alternative 2 / reason for
+rejection" (see app.ai.base.AlternativeActionSummary).
 """
 
 from __future__ import annotations
@@ -31,14 +34,14 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from app.ai.base import DecisionContext, DecisionDraft
-from app.models.enums import EventSeverity
+from app.ai.base import AlternativeActionSummary, DecisionContext, DecisionDraft
+from app.models.enums import EventSeverity, ExecutionActionType
 from app.services.event_service import POWER_SPIKE_DELTA_KW
 from app.simulation.physics import COMFORTABLE_TEMPERATURE_C, clamp
 from app.simulation.state import ClusterState, RackState
 
 if TYPE_CHECKING:
-    from app.forecasting.base import RackPrediction
+    from app.optimization.base import OptimizationPlan
 
 # --- Rule thresholds -------------------------------------------------------
 
@@ -59,13 +62,6 @@ REBALANCE_TEMPERATURE_THRESHOLD_C = 78.0
 REBALANCE_MIN_RACKS = 2
 
 DELAY_JOBS_POWER_DELTA_KW = POWER_SPIKE_DELTA_KW  # reuse event_service's definition of "a spike"
-
-# Proactive rule: look PROACTIVE_HORIZON_SECONDS ahead (the objective's own
-# "5 minutes" example) and recommend migration before the reactive
-# MIGRATION_TEMPERATURE_C threshold is ever actually crossed live.
-PROACTIVE_HORIZON_SECONDS = 300
-PROACTIVE_TEMPERATURE_THRESHOLD_C = 85.0
-PROACTIVE_MIN_CONFIDENCE = 40.0  # don't act on a low-confidence long-horizon guess
 
 
 @dataclass
@@ -115,17 +111,17 @@ class RuleBasedDecisionEngine:
                 drafts.append(migration)
 
             # Gated by the same warm-up window as the trend-based rules
-            # below: right after boot, ForecastService's own trend fit is
-            # working off only a handful of samples and can extrapolate a
-            # misleadingly confident-looking spike from ordinary settling
-            # noise (see ForecastService.EVENT_MIN_CONFIDENCE's docstring
-            # for the same issue on the forecasting side) — so a forecast
-            # alone isn't enough to justify acting on before the engine has
-            # otherwise proven itself past warm-up.
+            # below: right after boot, the forecasts an OptimizationPlan is
+            # built from are working off only a handful of samples and can
+            # extrapolate a misleadingly confident-looking spike from
+            # ordinary settling noise (see ForecastService.EVENT_MIN_
+            # CONFIDENCE's docstring for the same issue on the forecasting
+            # side) — so a plan alone isn't enough to justify acting on
+            # before the engine has otherwise proven itself past warm-up.
             if past_warmup:
-                proactive = self._rule_proactive_thermal_risk(rack, context.forecasts.get(rack.id, []))
-                if proactive is not None:
-                    drafts.append(proactive)
+                from_plan = self._rule_from_optimization_plan(rack, context.plans.get(rack.id))
+                if from_plan is not None:
+                    drafts.append(from_plan)
 
             if trend is not None and past_warmup:
                 if len(trend.window) >= COOLING_TREND_WINDOW_TICKS:
@@ -175,40 +171,68 @@ class RuleBasedDecisionEngine:
         )
 
     @staticmethod
-    def _rule_proactive_thermal_risk(rack: RackState, forecasts: list["RackPrediction"]) -> DecisionDraft | None:
-        """IF the current reading is still safe BUT the forecast for
-        PROACTIVE_HORIZON_SECONDS ahead crosses PROACTIVE_TEMPERATURE_
-        THRESHOLD_C (at reasonable confidence) THEN recommend proactive
-        migration — before the reactive workload_migration rule's live
-        threshold is ever crossed. This is the Decision Engine "using
-        forecasted telemetry" the objective asks for, directly.
+    def _rule_from_optimization_plan(rack: RackState, plan: "OptimizationPlan | None") -> DecisionDraft | None:
+        """IF the Optimization Engine has a plan for this rack (see
+        app.optimization) AND its winning candidate recommends real action
+        THEN build a recommendation directly from that plan's winner —
+        recommended_action/confidence/expected relief inherited from the
+        winning candidate's own simulated, scored outcome, never
+        re-derived here. This is the Decision Engine "consuming
+        OptimizationPlan instead of directly consuming Forecasts" the
+        objective asks for.
+
+        Deliberately skips CLUSTER_REBALANCE winners: that stays the
+        reactive _rule_cluster_rebalance's territory (cluster-scoped, not
+        rack-scoped — see rule_key formats), so a plan and the reactive
+        rule never produce two differently-worded decisions for what's
+        really the same cluster-wide recommendation. Also skips once the
+        rack is already in reactive workload_migration territory, for the
+        same "don't double-recommend" reason the old forecast-only version
+        of this rule already observed.
         """
+        if plan is None:
+            return None
+        winner = plan.winner
+        if winner.action_type in (ExecutionActionType.NO_ACTION, ExecutionActionType.CLUSTER_REBALANCE):
+            return None
         if rack.temperature > MIGRATION_TEMPERATURE_C:
-            return None  # already reactive-rule territory; don't double-recommend
-
-        forecast = next((f for f in forecasts if f.horizon_seconds == PROACTIVE_HORIZON_SECONDS), None)
-        if forecast is None:
-            return None
-        if forecast.predicted_temperature <= PROACTIVE_TEMPERATURE_THRESHOLD_C:
-            return None
-        if forecast.confidence < PROACTIVE_MIN_CONFIDENCE:
             return None
 
-        minutes = PROACTIVE_HORIZON_SECONDS // 60
+        alternatives = [
+            AlternativeActionSummary(
+                action_type=alt.action_type.value,
+                description=alt.description,
+                overall_score=alt.score.overall_score,
+                rejection_reason=alt.rejection_reason,
+            )
+            for alt in plan.alternatives[:2]
+        ]
+        alternatives_text = "; ".join(
+            f"{alt.description} ({alt.rejection_reason})" for alt in alternatives if alt.rejection_reason
+        )
+        reasoning = (
+            f"{plan.trigger_reason} The optimization engine evaluated {len(plan.candidates)} candidate "
+            f"actions and selected: {winner.description} (score {winner.score.overall_score:.0f}/100, "
+            f"{winner.score.confidence:.0f}% confidence, ~{winner.score.temperature_reduction_c:.1f}°C "
+            f"relief expected)."
+        )
+        if alternatives_text:
+            reasoning += f" Alternatives considered: {alternatives_text}."
+
         return DecisionDraft(
-            rule_key=f"proactive_thermal_risk:{rack.id}",
-            severity=EventSeverity.WARNING,
-            title=f"Proactive migration recommended for {rack.name}",
-            reasoning=(
-                f"{rack.name} is currently {rack.temperature:.1f}°C, but the {minutes}-minute forecast "
-                f"projects {forecast.predicted_temperature:.1f}°C ({forecast.confidence:.0f}% confidence) "
-                f"— above the {PROACTIVE_TEMPERATURE_THRESHOLD_C:.0f}°C threshold. Acting now avoids "
-                f"waiting for the threshold to actually be crossed."
+            rule_key=f"optimized_{winner.action_type.value}:{rack.id}",
+            severity=EventSeverity.CRITICAL if rack.temperature >= 90.0 else EventSeverity.WARNING,
+            title=f"{winner.description}",
+            reasoning=reasoning,
+            recommended_action=winner.description,
+            confidence=winner.score.confidence,
+            affected_racks=winner.affected_racks,
+            expected_temperature_reduction=(
+                winner.score.temperature_reduction_c if winner.score.temperature_reduction_c > 0 else None
             ),
-            recommended_action=f"Proactively migrate a portion of {rack.name}'s workload before it overheats.",
-            confidence=forecast.confidence,  # inherit the forecast's own confidence — honest, not re-fabricated
-            affected_racks=[rack.id],
-            expected_temperature_reduction=_estimate_temperature_relief(forecast.predicted_temperature),
+            expected_power_saving=(-winner.score.power_impact_kw if winner.score.power_impact_kw < 0 else None),
+            plan_id=plan.id,
+            alternative_actions=alternatives,
         )
 
     @staticmethod

@@ -9,16 +9,9 @@ import uuid
 from datetime import UTC, datetime
 
 from app.ai.base import DecisionContext
-from app.ai.rules import (
-    MIGRATION_TEMPERATURE_C,
-    PROACTIVE_HORIZON_SECONDS,
-    PROACTIVE_MIN_CONFIDENCE,
-    PROACTIVE_TEMPERATURE_THRESHOLD_C,
-    WARMUP_EVALUATIONS,
-    RuleBasedDecisionEngine,
-)
-from app.forecasting.base import RackPrediction
-from app.models.enums import RackStatus
+from app.ai.rules import MIGRATION_TEMPERATURE_C, WARMUP_EVALUATIONS, RuleBasedDecisionEngine
+from app.models.enums import ExecutionActionType, RackStatus
+from app.optimization.base import CandidateScore, OptimizationCandidate, OptimizationPlan
 from app.simulation.state import ClusterState, RackState
 
 
@@ -59,7 +52,7 @@ def _make_context(
     *,
     scenario_key: str = "normal",
     scenario_target_rack_id: uuid.UUID | None = None,
-    forecasts: dict[uuid.UUID, list[RackPrediction]] | None = None,
+    plans: dict[uuid.UUID, OptimizationPlan] | None = None,
 ) -> DecisionContext:
     return DecisionContext(
         cluster=_make_cluster(racks),
@@ -68,21 +61,53 @@ def _make_context(
         scenario_target_rack_id=scenario_target_rack_id,
         recent_events=[],
         now=datetime.now(UTC),
-        forecasts=forecasts or {},
+        plans=plans or {},
     )
 
 
-def _make_prediction(horizon_seconds: int, *, predicted_temperature: float, confidence: float) -> RackPrediction:
-    return RackPrediction(
-        horizon_seconds=horizon_seconds,
-        timestamp=datetime.now(UTC),
-        predicted_temperature=predicted_temperature,
-        predicted_gpu_utilization=80.0,
-        predicted_power=10.0,
-        predicted_health=70.0,
-        predicted_cooling=50.0,
-        predicted_risk=60.0,
+def _make_score(overall_score: float, *, confidence: float = 70.0, temperature_reduction_c: float = 5.0) -> CandidateScore:
+    return CandidateScore(
+        temperature_reduction_c=temperature_reduction_c,
+        power_impact_kw=-1.0,
+        cooling_improvement_pct=5.0,
+        execution_cost=20.0,
+        operational_disruption=15.0,
+        risk_reduction=10.0,
+        estimated_recovery_seconds=20.0,
         confidence=confidence,
+        overall_score=overall_score,
+    )
+
+
+def _make_candidate(
+    action_type: ExecutionActionType,
+    rack: RackState,
+    *,
+    overall_score: float = 60.0,
+    confidence: float = 70.0,
+    temperature_reduction_c: float = 5.0,
+    rejection_reason: str | None = None,
+) -> OptimizationCandidate:
+    return OptimizationCandidate(
+        action_type=action_type,
+        description=f"{action_type.value.replace('_', ' ').title()} on {rack.name}.",
+        affected_racks=[rack.id],
+        redistribute_racks=[],
+        projected_temperature=rack.temperature - temperature_reduction_c,
+        projected_cooling=rack.cooling_efficiency + 5.0,
+        projected_power=rack.power_draw - 1.0,
+        score=_make_score(overall_score, confidence=confidence, temperature_reduction_c=temperature_reduction_c),
+        rejection_reason=rejection_reason,
+    )
+
+
+def _make_plan(rack: RackState, candidates: list[OptimizationCandidate], *, reason: str = "Trigger reason.") -> OptimizationPlan:
+    return OptimizationPlan(
+        trigger_key=f"rack_plan:{rack.id}",
+        trigger_rack_id=rack.id,
+        trigger_reason=reason,
+        candidates=candidates,
+        now=datetime.now(UTC),
     )
 
 
@@ -312,107 +337,116 @@ def test_recommendations_are_identical_regardless_of_scenario_key() -> None:
     assert keys_normal == keys_other
 
 
-# --- proactive thermal risk (forecast-driven) -----------------------------
+# --- plan-driven recommendations (Optimization Engine-driven) ------------
 
 
 def _pass_warmup(engine: RuleBasedDecisionEngine) -> None:
-    """The proactive rule shares the trend rules' warm-up gate (see
-    app.ai.rules — a forecast can carry the same kind of post-boot
-    settling noise a live trend can), so exercising it needs the engine
-    warmed up first, same as test_cooling_intervention_* above.
+    """This rule shares the trend rules' warm-up gate (see app.ai.rules —
+    a plan can carry the same kind of post-boot settling noise a live
+    trend can), so exercising it needs the engine warmed up first, same as
+    test_cooling_intervention_* above.
     """
     for _ in range(WARMUP_EVALUATIONS + 1):
         engine.evaluate(_make_context([_make_rack(id=uuid.uuid4())]))
 
 
-def test_proactive_thermal_risk_fires_when_forecast_crosses_threshold() -> None:
-    """The 74°C -> 88°C-in-5-minutes example from the objective: currently
-    safe, but the 300s forecast crosses PROACTIVE_TEMPERATURE_THRESHOLD_C
-    at high confidence.
+def test_plan_driven_rule_fires_from_the_plans_winning_candidate() -> None:
+    """The recommendation, confidence, and expected relief all come
+    straight from the plan's winning candidate — nothing re-derived here.
     """
     engine = RuleBasedDecisionEngine()
     _pass_warmup(engine)
     rack = _make_rack(temperature=74.0, gpu_utilization=70.0)
-    forecasts = {
-        rack.id: [
-            _make_prediction(30, predicted_temperature=76.0, confidence=90.0),
-            _make_prediction(300, predicted_temperature=88.0, confidence=70.0),
-        ]
-    }
-    drafts = engine.evaluate(_make_context([rack], forecasts=forecasts))
+    winner = _make_candidate(
+        ExecutionActionType.WORKLOAD_MIGRATION, rack, overall_score=80.0, confidence=70.0, temperature_reduction_c=8.0
+    )
+    runner_up = _make_candidate(
+        ExecutionActionType.FAN_OVERRIDE, rack, overall_score=40.0, rejection_reason="Less temperature relief."
+    )
+    plan = _make_plan(rack, [winner, runner_up])
+    drafts = engine.evaluate(_make_context([rack], plans={rack.id: plan}))
 
-    matches = [d for d in drafts if d.rule_key == f"proactive_thermal_risk:{rack.id}"]
+    matches = [d for d in drafts if d.rule_key == f"optimized_workload_migration:{rack.id}"]
     assert len(matches) == 1
-    assert matches[0].affected_racks == [rack.id]
-    assert matches[0].confidence == 70.0
-    assert "proactiv" in matches[0].recommended_action.lower()
+    match = matches[0]
+    assert match.affected_racks == [rack.id]
+    assert match.confidence == 70.0
+    assert match.expected_temperature_reduction == 8.0
+    assert match.plan_id == plan.id
+    assert len(match.alternative_actions) == 1
+    assert match.alternative_actions[0].rejection_reason == "Less temperature relief."
 
 
-def test_proactive_thermal_risk_does_not_fire_when_forecast_stays_safe() -> None:
+def test_plan_driven_rule_does_not_fire_when_winner_is_no_action() -> None:
     engine = RuleBasedDecisionEngine()
     _pass_warmup(engine)
     rack = _make_rack(temperature=74.0)
-    forecasts = {
-        rack.id: [_make_prediction(300, predicted_temperature=79.0, confidence=90.0)]  # below threshold
-    }
-    drafts = engine.evaluate(_make_context([rack], forecasts=forecasts))
-    assert not any(d.rule_key.startswith("proactive_thermal_risk") for d in drafts)
+    winner = _make_candidate(ExecutionActionType.NO_ACTION, rack, overall_score=50.0)
+    plan = _make_plan(rack, [winner])
+    drafts = engine.evaluate(_make_context([rack], plans={rack.id: plan}))
+    assert not any(d.rule_key.startswith("optimized_") for d in drafts)
 
 
-def test_proactive_thermal_risk_does_not_fire_below_confidence_floor() -> None:
+def test_plan_driven_rule_does_not_fire_when_winner_is_cluster_rebalance() -> None:
+    """cluster_rebalance stays the reactive rule's territory — see
+    RuleBasedDecisionEngine._rule_from_optimization_plan's docstring.
+    """
     engine = RuleBasedDecisionEngine()
     _pass_warmup(engine)
     rack = _make_rack(temperature=74.0)
-    forecasts = {
-        rack.id: [
-            _make_prediction(
-                PROACTIVE_HORIZON_SECONDS,
-                predicted_temperature=PROACTIVE_TEMPERATURE_THRESHOLD_C + 5.0,
-                confidence=PROACTIVE_MIN_CONFIDENCE - 1.0,
-            )
-        ]
-    }
-    drafts = engine.evaluate(_make_context([rack], forecasts=forecasts))
-    assert not any(d.rule_key.startswith("proactive_thermal_risk") for d in drafts)
+    winner = _make_candidate(ExecutionActionType.CLUSTER_REBALANCE, rack, overall_score=70.0)
+    plan = _make_plan(rack, [winner])
+    drafts = engine.evaluate(_make_context([rack], plans={rack.id: plan}))
+    assert not any(d.rule_key.startswith("optimized_") for d in drafts)
 
 
-def test_proactive_thermal_risk_does_not_fire_once_already_in_reactive_territory() -> None:
+def test_plan_driven_rule_does_not_fire_without_a_plan() -> None:
+    engine = RuleBasedDecisionEngine()
+    _pass_warmup(engine)
+    rack = _make_rack(temperature=74.0)
+    drafts = engine.evaluate(_make_context([rack]))
+    assert not any(d.rule_key.startswith("optimized_") for d in drafts)
+
+
+def test_plan_driven_rule_does_not_fire_once_already_in_reactive_territory() -> None:
     """Once the rack is already past MIGRATION_TEMPERATURE_C, the reactive
     workload_migration rule owns the recommendation — no duplicate from
-    the proactive rule.
+    the plan-driven rule.
     """
     engine = RuleBasedDecisionEngine()
     _pass_warmup(engine)
     rack = _make_rack(temperature=MIGRATION_TEMPERATURE_C + 1.0, gpu_utilization=95.0)
-    forecasts = {
-        rack.id: [_make_prediction(PROACTIVE_HORIZON_SECONDS, predicted_temperature=95.0, confidence=90.0)]
-    }
-    drafts = engine.evaluate(_make_context([rack], forecasts=forecasts))
-    assert not any(d.rule_key.startswith("proactive_thermal_risk") for d in drafts)
+    winner = _make_candidate(ExecutionActionType.WORKLOAD_MIGRATION, rack, overall_score=80.0)
+    plan = _make_plan(rack, [winner])
+    drafts = engine.evaluate(_make_context([rack], plans={rack.id: plan}))
+    assert not any(d.rule_key.startswith("optimized_") for d in drafts)
     assert any(d.rule_key.startswith("workload_migration") for d in drafts)
 
 
-def test_proactive_thermal_risk_does_not_fire_without_a_matching_horizon() -> None:
-    engine = RuleBasedDecisionEngine()
-    _pass_warmup(engine)
-    rack = _make_rack(temperature=74.0)
-    forecasts = {
-        rack.id: [_make_prediction(30, predicted_temperature=95.0, confidence=90.0)]  # wrong horizon only
-    }
-    drafts = engine.evaluate(_make_context([rack], forecasts=forecasts))
-    assert not any(d.rule_key.startswith("proactive_thermal_risk") for d in drafts)
-
-
-def test_proactive_thermal_risk_stays_quiet_during_warmup_even_with_a_confident_forecast() -> None:
+def test_plan_driven_rule_stays_quiet_during_warmup_even_with_a_confident_plan() -> None:
     """Mirrors test_cooling_intervention_stays_quiet_during_warmup_even_
-    with_a_sharp_change: a freshly booted engine shouldn't act on a
-    forecast either, no matter how confident it claims to be, until the
-    warm-up window has passed.
+    with_a_sharp_change: a freshly booted engine shouldn't act on a plan
+    either, no matter how confident it claims to be, until the warm-up
+    window has passed.
     """
     engine = RuleBasedDecisionEngine()
     rack = _make_rack(temperature=74.0)
-    forecasts = {
-        rack.id: [_make_prediction(PROACTIVE_HORIZON_SECONDS, predicted_temperature=90.0, confidence=90.0)]
-    }
-    drafts = engine.evaluate(_make_context([rack], forecasts=forecasts))
-    assert not any(d.rule_key.startswith("proactive_thermal_risk") for d in drafts)
+    winner = _make_candidate(ExecutionActionType.WORKLOAD_MIGRATION, rack, overall_score=90.0, confidence=90.0)
+    plan = _make_plan(rack, [winner])
+    drafts = engine.evaluate(_make_context([rack], plans={rack.id: plan}))
+    assert not any(d.rule_key.startswith("optimized_") for d in drafts)
+
+
+def test_plan_driven_rule_alternatives_are_capped_at_two() -> None:
+    engine = RuleBasedDecisionEngine()
+    _pass_warmup(engine)
+    rack = _make_rack(temperature=74.0)
+    winner = _make_candidate(ExecutionActionType.WORKLOAD_MIGRATION, rack, overall_score=80.0)
+    alt1 = _make_candidate(ExecutionActionType.FAN_OVERRIDE, rack, overall_score=60.0, rejection_reason="a")
+    alt2 = _make_candidate(ExecutionActionType.JOB_DELAY, rack, overall_score=50.0, rejection_reason="b")
+    alt3 = _make_candidate(ExecutionActionType.COOLING_ADJUSTMENT, rack, overall_score=40.0, rejection_reason="c")
+    plan = _make_plan(rack, [winner, alt1, alt2, alt3])
+    drafts = engine.evaluate(_make_context([rack], plans={rack.id: plan}))
+
+    match = next(d for d in drafts if d.rule_key.startswith("optimized_"))
+    assert len(match.alternative_actions) == 2

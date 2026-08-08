@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from app.schemas.cluster import ClusterTelemetry
 from app.schemas.decision import DecisionRead
 from app.schemas.forecast import ClusterForecastRead, ForecastPoint, RackForecastRead
+from app.schemas.optimization import OptimizationPlanRead
 from app.schemas.rack import RackTelemetry
 from app.schemas.scenario import ScenarioStatus
 from app.utils.time import utcnow
@@ -26,6 +27,7 @@ class TelemetrySnapshot(BaseModel):
     decisions: list[DecisionRead]
     forecast: ClusterForecastRead
     rack_forecasts: list[RackForecastRead]
+    plans: list[OptimizationPlanRead]
 
     @classmethod
     def from_simulation(cls, simulation: "SimulationService", timestamp: datetime | None = None) -> "TelemetrySnapshot":
@@ -34,12 +36,17 @@ class TelemetrySnapshot(BaseModel):
         Shared by the WebSocket endpoint (initial snapshot on connect), the
         simulation engine (per-tick broadcast), and scenario/decision
         changes (immediate broadcast) — one place that knows how to turn
-        engine state into this payload shape. Active decisions and the
-        latest forecast are always included here (not separate message
-        types), which is also what makes a confidence-only update visible
-        on the very next regular tick without any special-cased broadcast
-        path — "current state, prediction, risk, confidence" together,
-        every tick, per the objective.
+        engine state into this payload shape. Active decisions, the latest
+        forecast, and active optimization plans are always included here
+        (not separate message types), which is also what makes a
+        confidence-only update visible on the very next regular tick
+        without any special-cased broadcast path — "current state,
+        prediction, risk, confidence" together, every tick, per the
+        objective. `plans` carries every candidate action considered and
+        the winner/alternatives split (see OptimizationPlanRead) for
+        whichever rack(s) currently have an active plan — "candidate
+        actions, best action, expected improvement, confidence" per the
+        optimization objective.
         """
         return cls(
             timestamp=timestamp or utcnow(),
@@ -58,4 +65,5 @@ class TelemetrySnapshot(BaseModel):
                 )
                 for rack in simulation.rack_states
             ],
+            plans=[OptimizationPlanRead.from_row(plan) for plan in simulation.active_plans],
         )

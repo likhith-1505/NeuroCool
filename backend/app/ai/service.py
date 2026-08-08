@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -37,7 +38,7 @@ from app.services.event_service import EventDraft, persist_events
 from app.simulation.state import ClusterState, RackState
 
 if TYPE_CHECKING:
-    from app.forecasting.base import RackPrediction
+    from app.optimization.base import OptimizationPlan
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,7 @@ class DecisionService:
         cluster_db_id: uuid.UUID,
         scenario_db_id: uuid.UUID | None,
         now: datetime,
-        forecasts: dict[uuid.UUID, list["RackPrediction"]] | None = None,
+        plans: dict[uuid.UUID, "OptimizationPlan"] | None = None,
     ) -> list[Event]:
         """Evaluate the cluster, upsert (dedupe/update) active decisions,
         and expire stale ones. Returns the lifecycle events raised this
@@ -92,9 +93,10 @@ class DecisionService:
         broadcast — confidence-only updates raise no event, see module
         docstring.
 
-        `forecasts` is ForecastService's latest output (see
-        app.forecasting) — optional and defaulted so this stays callable
-        exactly as before anywhere forecasts aren't available yet.
+        `plans` is OptimizationService's latest output (see
+        app.optimization), keyed by trigger rack id — optional and
+        defaulted so this stays callable exactly as before anywhere plans
+        aren't available yet.
         """
         async with AsyncSessionLocal() as db:
             recent_events = await self._recent_events(db)
@@ -105,7 +107,7 @@ class DecisionService:
                 scenario_target_rack_id=scenario_target_rack_id,
                 recent_events=recent_events,
                 now=now,
-                forecasts=forecasts or {},
+                plans=plans or {},
             )
             drafts = self._engine.evaluate(context)
 
@@ -186,6 +188,8 @@ class DecisionService:
                 row.recommended_action = draft.recommended_action
                 row.expected_temperature_reduction = draft.expected_temperature_reduction
                 row.expected_power_saving = draft.expected_power_saving
+                row.plan_id = draft.plan_id
+                row.alternative_actions = [asdict(alt) for alt in draft.alternative_actions]
                 row.expires_at = now + timedelta(seconds=draft.ttl_seconds)
                 await db.commit()
                 await db.refresh(row)
@@ -198,6 +202,7 @@ class DecisionService:
         row = Decision(
             cluster_id=cluster_db_id,
             scenario_id=scenario_db_id,
+            plan_id=draft.plan_id,
             rule_key=draft.rule_key,
             severity=draft.severity,
             title=draft.title,
@@ -208,6 +213,7 @@ class DecisionService:
             confidence=draft.confidence,
             affected_racks=draft.affected_racks,
             affected_jobs=[],  # placeholder — no Job model exists yet
+            alternative_actions=[asdict(alt) for alt in draft.alternative_actions],
             status=DecisionStatus.PENDING,
             expires_at=now + timedelta(seconds=draft.ttl_seconds),
         )

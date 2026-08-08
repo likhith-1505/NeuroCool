@@ -36,10 +36,20 @@ _ACTION_BY_RULE_PREFIX: dict[str, ExecutionActionType] = {
     "cooling_intervention": ExecutionActionType.COOLING_ADJUSTMENT,
     "delay_new_jobs": ExecutionActionType.JOB_DELAY,
     "cluster_rebalance": ExecutionActionType.CLUSTER_REBALANCE,
-    # A proactive recommendation (see app.ai.rules) is the same remediation
-    # as a reactive workload_migration, just triggered earlier from a
-    # forecast instead of live telemetry — same action, different trigger.
-    "proactive_thermal_risk": ExecutionActionType.WORKLOAD_MIGRATION,
+    # A decision derived from an app.optimization.OptimizationPlan (see
+    # app.ai.rules._rule_from_optimization_plan) always uses this
+    # "optimized_<action_type value>" rule_key prefix, kept in its own
+    # namespace rather than aliased onto the reactive prefixes above — the
+    # action_type *values* don't all textually match their reactive-rule
+    # counterparts (e.g. "cooling_adjustment" vs "cooling_intervention"),
+    # so a shared namespace would dedupe some pairs and not others by
+    # accident. NO_ACTION is deliberately absent: a plan whose winner is
+    # NO_ACTION never produces a decision at all.
+    "optimized_workload_migration": ExecutionActionType.WORKLOAD_MIGRATION,
+    "optimized_cooling_adjustment": ExecutionActionType.COOLING_ADJUSTMENT,
+    "optimized_job_delay": ExecutionActionType.JOB_DELAY,
+    "optimized_cluster_rebalance": ExecutionActionType.CLUSTER_REBALANCE,
+    "optimized_fan_override": ExecutionActionType.FAN_OVERRIDE,
 }
 
 # Event raised when an action reaches full effect (ramp-in complete).
@@ -49,6 +59,7 @@ _TOOK_EFFECT_TITLES: dict[ExecutionActionType, str] = {
     ExecutionActionType.WORKLOAD_MIGRATION: "Migration Completed",
     ExecutionActionType.COOLING_ADJUSTMENT: "Cooling Increased",
     ExecutionActionType.CLUSTER_REBALANCE: "Cluster Rebalanced",
+    ExecutionActionType.FAN_OVERRIDE: "Fan Override Engaged",
 }
 
 _SUMMARY_TEMPLATES: dict[ExecutionActionType, str] = {
@@ -56,6 +67,7 @@ _SUMMARY_TEMPLATES: dict[ExecutionActionType, str] = {
     ExecutionActionType.COOLING_ADJUSTMENT: "Increasing fan response and cooling capacity on {primary}.",
     ExecutionActionType.JOB_DELAY: "Delaying new job scheduling on {primary}.",
     ExecutionActionType.CLUSTER_REBALANCE: "Redistributing utilization from {primary} onto {redistribute}.",
+    ExecutionActionType.FAN_OVERRIDE: "Overriding fan curve on {primary}.",
 }
 
 

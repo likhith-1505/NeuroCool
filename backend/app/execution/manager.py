@@ -66,6 +66,14 @@ EFFECTS: dict[ExecutionActionType, ExecutionEffect] = {
         primary_gpu_bias=-20.0,  # per affected rack
         redistribute_gpu_bias=6.0,  # per other healthy rack — spread thinner than a targeted migration
     ),
+    ExecutionActionType.FAN_OVERRIDE: ExecutionEffect(
+        action_type=ExecutionActionType.FAN_OVERRIDE,
+        fan_bias=18.0,  # push fans, but without COOLING_ADJUSTMENT's added cooling_bias — a lighter-touch option
+    ),
+    # NO_ACTION intentionally has no entry: it is a valid app.optimization
+    # candidate (see app.optimization.base) but is never actually executed
+    # — ExecutionService never receives a decision whose winning candidate
+    # was NO_ACTION, so there is no driver effect to define for it.
 }
 
 

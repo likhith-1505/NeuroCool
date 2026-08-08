@@ -34,6 +34,16 @@ class Decision(Base):
     scenario_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("scenarios.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # The OptimizationPlan this decision was derived from, if any (see
+    # app.optimization) — nullable because the reactive rules in app.ai.rules
+    # still reason directly from telemetry, not every rule's threshold, not
+    # every decision goes through planning. Nulled rather than cascade-
+    # deleted if the plan is ever pruned: the decision's own recommended_
+    # action/confidence/reasoning stand on their own, plan_id is only a
+    # pointer to the fuller candidate/alternatives detail.
+    plan_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("optimization_plans.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
     # Stable identifier for *what kind* of recommendation this is (e.g.
     # "workload_migration:<rack_id>"), used to deduplicate repeated firings
@@ -51,6 +61,17 @@ class Decision(Base):
         ARRAY(UUID(as_uuid=True)), nullable=False, default=list
     )
     affected_jobs: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # Compact snapshot of the runner-up candidates from the OptimizationPlan
+    # this decision came from (empty list for decisions that didn't go
+    # through planning) — {action_type, description, overall_score,
+    # rejection_reason} per alternative, at most 2 ("Alternative 1",
+    # "Alternative 2" per the objective). The plan itself (see plan_id)
+    # remains the canonical, full-detail record — this is a denormalized
+    # summary so a single GET /api/decisions/{id} already answers "what
+    # else was considered and why not" without a second round trip, the
+    # same way expected_temperature_reduction is already a derived summary
+    # rather than a pointer back into the rule that computed it.
+    alternative_actions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     status: Mapped[DecisionStatus] = mapped_column(
         Enum(DecisionStatus, name="decision_status"), default=DecisionStatus.PENDING, nullable=False
     )
