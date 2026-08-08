@@ -187,3 +187,142 @@ async def test_openai_provider_error_never_leaks_the_api_key() -> None:
         with pytest.raises(ProviderError) as exc_info:
             await provider.generate(system="sys", messages=[{"role": "user", "content": "hi"}], max_tokens=100)
     assert "sk-super-secret" not in str(exc_info.value)
+
+
+# --- tool calling: Anthropic -----------------------------------------------
+
+
+async def test_anthropic_provider_parses_a_tool_use_response() -> None:
+    provider = AnthropicProvider(api_key="sk-test", model="claude-sonnet-5")
+    fake_response = _FakeHttpResponse(
+        {
+            "content": [
+                {"type": "text", "text": "Let me check."},
+                {"type": "tool_use", "id": "toolu_1", "name": "read_rack", "input": {"rack_id": "abc"}},
+            ],
+            "model": "claude-sonnet-5", "stop_reason": "tool_use", "usage": {"input_tokens": 10, "output_tokens": 5},
+        }
+    )
+    with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=fake_response)):
+        result = await provider.generate(
+            system="sys", messages=[{"role": "user", "content": "Check rack A1"}], max_tokens=100,
+            tools=[{"name": "read_rack", "description": "Read a rack", "input_schema": {"type": "object"}}],
+        )
+
+    assert result.text == "Let me check."
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0]["name"] == "read_rack"
+    assert result.tool_calls[0]["arguments"] == {"rack_id": "abc"}
+
+
+async def test_anthropic_provider_sends_tools_and_tool_result_messages() -> None:
+    provider = AnthropicProvider(api_key="sk-test", model="claude-sonnet-5")
+    fake_response = _FakeHttpResponse({"content": [{"type": "text", "text": "done"}], "model": "claude-sonnet-5", "usage": {}})
+    captured = {}
+
+    async def _capture_post(self, url, *, json, headers):
+        captured["json"] = json
+        return fake_response
+
+    with patch("httpx.AsyncClient.post", new=_capture_post):
+        await provider.generate(
+            system="sys",
+            messages=[
+                {"role": "user", "content": "Check rack A1"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "toolu_1", "name": "read_rack", "arguments": {"rack_id": "abc"}}]},
+                {"role": "tool", "tool_call_id": "toolu_1", "content": '{"temperature": 70.0}'},
+            ],
+            max_tokens=100,
+            tools=[{"name": "read_rack", "description": "Read a rack", "input_schema": {"type": "object"}}],
+        )
+
+    assert captured["json"]["tools"][0]["name"] == "read_rack"
+    sent_messages = captured["json"]["messages"]
+    assert sent_messages[1]["content"][0]["type"] == "tool_use"
+    assert sent_messages[2]["role"] == "user"  # Anthropic represents tool results as a user turn
+    assert sent_messages[2]["content"][0]["type"] == "tool_result"
+    assert sent_messages[2]["content"][0]["tool_use_id"] == "toolu_1"
+
+
+# --- tool calling: OpenAI ---------------------------------------------------
+
+
+async def test_openai_provider_parses_a_tool_calls_response() -> None:
+    provider = OpenAIProvider(api_key="sk-test", model="gpt-4o-mini")
+    fake_response = _FakeHttpResponse(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant", "content": None,
+                        "tool_calls": [
+                            {"id": "call_1", "type": "function", "function": {"name": "read_rack", "arguments": '{"rack_id": "abc"}'}}
+                        ],
+                    }
+                }
+            ],
+            "model": "gpt-4o-mini", "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+    )
+    with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=fake_response)):
+        result = await provider.generate(
+            system="sys", messages=[{"role": "user", "content": "Check rack A1"}], max_tokens=100,
+            tools=[{"name": "read_rack", "description": "Read a rack", "input_schema": {"type": "object"}}],
+        )
+
+    assert result.text == ""
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0]["name"] == "read_rack"
+    assert result.tool_calls[0]["arguments"] == {"rack_id": "abc"}
+
+
+async def test_openai_provider_sends_tools_and_tool_result_messages() -> None:
+    provider = OpenAIProvider(api_key="sk-test", model="gpt-4o-mini")
+    fake_response = _FakeHttpResponse({"choices": [{"message": {"content": "done"}}], "model": "gpt-4o-mini", "usage": {}})
+    captured = {}
+
+    async def _capture_post(self, url, *, json, headers):
+        captured["json"] = json
+        return fake_response
+
+    with patch("httpx.AsyncClient.post", new=_capture_post):
+        await provider.generate(
+            system="sys",
+            messages=[
+                {"role": "user", "content": "Check rack A1"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "name": "read_rack", "arguments": {"rack_id": "abc"}}]},
+                {"role": "tool", "tool_call_id": "call_1", "content": '{"temperature": 70.0}'},
+            ],
+            max_tokens=100,
+            tools=[{"name": "read_rack", "description": "Read a rack", "input_schema": {"type": "object"}}],
+        )
+
+    assert captured["json"]["tools"][0]["function"]["name"] == "read_rack"
+    sent_messages = captured["json"]["messages"]
+    assert sent_messages[0]["role"] == "system"
+    assistant_message = next(m for m in sent_messages if m.get("role") == "assistant" and m.get("tool_calls"))
+    assert assistant_message["tool_calls"][0]["function"]["arguments"] == '{"rack_id": "abc"}'
+    tool_message = next(m for m in sent_messages if m.get("role") == "tool")
+    assert tool_message["tool_call_id"] == "call_1"
+
+
+# --- mock provider scripted tool-calling -----------------------------------
+
+
+async def test_mock_provider_scripted_responses_are_returned_in_order() -> None:
+    from app.neurocore.providers.base import LLMResponse, ToolCall
+
+    provider = MockLLMProvider(
+        responses=[
+            LLMResponse(text="", model="mock-1", tool_calls=[ToolCall(id="c1", name="read_rack", arguments={"rack_id": "abc"})]),
+            LLMResponse(text="Final answer.", model="mock-1"),
+        ]
+    )
+
+    first = await provider.generate(system="sys", messages=[{"role": "user", "content": "hi"}], max_tokens=100)
+    second = await provider.generate(system="sys", messages=[{"role": "user", "content": "hi"}], max_tokens=100)
+
+    assert len(first.tool_calls) == 1
+    assert first.tool_calls[0]["name"] == "read_rack"
+    assert second.text == "Final answer."
+    assert provider.call_count == 2

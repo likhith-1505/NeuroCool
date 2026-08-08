@@ -5,12 +5,14 @@ that autogenerate can see the complete schema.
 """
 
 from app.db.base_class import Base
+from app.models.audit_log import ActionAuditLog
 from app.models.cluster import Cluster
 from app.models.conversation import Conversation, ConversationMessage
 from app.models.decision import Decision
 from app.models.event import Event
 from app.models.execution import Execution
 from app.models.optimization_plan import OptimizationPlan
+from app.models.pending_action import PendingAction
 from app.models.rack import Rack
 from app.models.scenario import Scenario
 from app.models.telemetry import TelemetryRecord
@@ -27,4 +29,6 @@ __all__ = [
     "OptimizationPlan",
     "Conversation",
     "ConversationMessage",
+    "PendingAction",
+    "ActionAuditLog",
 ]

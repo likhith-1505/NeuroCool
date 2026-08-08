@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from app.models.decision import Decision
     from app.models.execution import Execution
     from app.models.optimization_plan import OptimizationPlan
-    from app.simulation.engine import SimulationService
+    from app.neurocore.ports import SimulationPort
     from app.simulation.state import ClusterState, RackState
 
 # How far back NeuroCore is allowed to look for "what changed recently" —
@@ -100,7 +100,7 @@ def build_context(
     )
 
 
-async def load_context(db: AsyncSession, simulation: "SimulationService") -> NeuroCoreContext:
+async def load_context(db: AsyncSession, simulation: "SimulationPort") -> NeuroCoreContext:
     """Thin, DB-touching glue — see module docstring. `simulation`'s
     properties are already the live, in-memory source of truth for
     everything except recent events.

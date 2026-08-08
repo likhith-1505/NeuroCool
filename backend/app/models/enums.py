@@ -64,3 +64,24 @@ class ConversationRole(str, enum.Enum):
 
     USER = "user"
     ASSISTANT = "assistant"
+
+
+class PendingActionType(str, enum.Enum):
+    """What a PendingAction, once confirmed, actually does — see
+    app.neurocore.actions. Both map onto an *existing* backend entry
+    point (SimulationService.execute_decision / .replay_scenario); a
+    PendingAction never invents a new mutation path.
+    """
+
+    EXECUTE_DECISION = "execute_decision"
+    REPLAY_SIMULATION = "replay_simulation"
+
+
+class PendingActionStatus(str, enum.Enum):
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+    EXECUTING = "executing"
+    COMPLETED = "completed"
+    FAILED = "failed"
