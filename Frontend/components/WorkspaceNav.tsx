@@ -1,9 +1,12 @@
 import { motion } from "framer-motion";
 import { NavLink } from "react-router-dom";
+import type { ConnectionStatus } from "../lib/wsClient";
+import ConnectionBadge from "./ConnectionBadge";
 
 type WorkspaceNavProps = {
   clusterStatus: string;
   theme: "dark" | "light";
+  connectionStatus: ConnectionStatus;
   onToggleTheme: () => void;
   onOpenPalette: () => void;
 };
@@ -16,7 +19,7 @@ const links = [
   { label: "Settings", to: "/settings" },
 ];
 
-export default function WorkspaceNav({ clusterStatus, theme, onToggleTheme, onOpenPalette }: WorkspaceNavProps) {
+export default function WorkspaceNav({ clusterStatus, theme, connectionStatus, onToggleTheme, onOpenPalette }: WorkspaceNavProps) {
   return (
     <header className="sticky top-0 z-40 px-3 pt-3 sm:px-5 sm:pt-4 lg:px-8">
       <nav className="mx-auto grid h-14 w-full max-w-[1720px] grid-cols-[auto_1fr_auto] items-center gap-3 rounded-full bg-[linear-gradient(120deg,rgba(255,255,255,0.085),rgba(255,255,255,0.02))] px-3 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.08),0_18px_48px_rgba(0,0,0,0.45)] backdrop-blur-[24px] sm:px-4">
@@ -63,6 +66,8 @@ export default function WorkspaceNav({ clusterStatus, theme, onToggleTheme, onOp
         </div>
 
         <div className="flex items-center justify-end gap-1.5">
+          <ConnectionBadge status={connectionStatus} />
+
           <div
             className="hidden items-center gap-2 rounded-full border px-3 py-1 md:inline-flex"
             style={{ borderColor: "rgba(var(--accent-rgb),0.14)", background: "rgba(var(--accent-rgb),0.08)" }}

@@ -1,24 +1,28 @@
 import { AnimatePresence, motion } from "framer-motion";
 import { useMemo, useRef, useState } from "react";
 import AnimatedValue from "../components/AnimatedValue";
-import { SCENARIOS, useScenarioEngine, type ScenarioRack } from "../scenario/ScenarioEngine";
+import LoadingState from "../components/LoadingState";
+import { SCENARIOS, useScenarioEngine } from "../scenario/ScenarioEngine";
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-/** A smooth, deterministic trailing series that always lands exactly on the current
- * live value — so the chart reads as "history leading up to right now" rather than
- * random noise, and reacts honestly when the scenario changes. */
-function buildTrend(current: number, points: number): number[] {
-  const series: number[] = [];
-  for (let i = 0; i < points; i += 1) {
-    const t = i / (points - 1);
-    const wave = Math.sin(t * Math.PI * 2.3 + 1.1) * 3.4 + Math.sin(t * Math.PI * 5.4) * 1.2;
-    series.push(current - 4.5 + wave + t * 4);
-  }
-  series[series.length - 1] = current;
-  return series;
+/** This backend keeps no historical time-series (see
+ * backend/app/forecasting/service.py's module docstring — forecasts are
+ * always the latest computed snapshot, recomputed every tick). The only
+ * genuinely multi-point real series it exposes is *forward-looking*: the
+ * cluster/rack forecast horizons. Rather than fabricate a trailing
+ * "history", every chart on this page plots that real forecast curve,
+ * anchored at the real current reading (the one point that isn't a
+ * prediction) — see the integration objective's "adapt the existing UI to
+ * show live data rather than pretending historical data exists".
+ */
+function forecastSeries(current: number, predictions: Array<{ horizon_seconds: number; value: number }>): number[] {
+  const sorted = [...predictions].sort((a, b) => a.horizon_seconds - b.horizon_seconds);
+  const series = [current, ...sorted.map((point) => point.value)];
+  // buildSmoothPath needs at least two points to divide the width by.
+  return series.length >= 2 ? series : [current, current];
 }
 
 function buildSmoothPath(values: number[], width: number, height: number, min: number, max: number) {
@@ -42,10 +46,6 @@ function buildSmoothPath(values: number[], width: number, height: number, min: n
 
   const area = `${line} L ${last.x},${height} L ${points[0].x},${height} Z`;
   return { line, area, points };
-}
-
-function healthScoreFor(rack: ScenarioRack): number {
-  return Math.round(clamp(100 - (rack.temperature - 55) * 1.6 - (rack.gpu - 45) * 0.35, 8, 99));
 }
 
 function heatColor(score: number): string {
@@ -115,29 +115,39 @@ function RingStat({ label, value, display, tone, detail }: { label: string; valu
 }
 
 export default function AnalyticsWorkspace() {
-  const { scenario, metrics, ai, racks } = useScenarioEngine();
+  const { scenario, metrics, ai, racks, cluster, clusterForecast, isLoading } = useScenarioEngine();
   const chartRef = useRef<HTMLDivElement>(null);
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
 
-  const trend = useMemo(() => buildTrend(metrics.avgTemperature, 20), [metrics.avgTemperature]);
+  const trend = useMemo(
+    () => forecastSeries(metrics.avgTemperature, clusterForecast.map((p) => ({ horizon_seconds: p.horizon_seconds, value: p.predicted_temperature }))),
+    [metrics.avgTemperature, clusterForecast],
+  );
   const trendPath = useMemo(() => {
     const min = Math.min(...trend) - 2;
     const max = Math.max(...trend) + 2;
     return buildSmoothPath(trend, 100, 40, min, max);
   }, [trend]);
 
-  const efficiencyScore = clamp(metrics.clusterHealth * 0.65 + metrics.energySaved * 1.1, 0, 100);
-  const predictionAccuracy = clamp(ai.confidence + 2, 0, 100);
+  // Cluster Efficiency: composite of two real fields (overall health,
+  // cooling efficiency) — no backend "efficiency" field exists directly.
+  const efficiencyScore = cluster ? clamp(cluster.overall_health * 0.6 + cluster.cooling_efficiency * 0.4, 0, 100) : 0;
+  // Real fields, passed through directly — not derived/fabricated.
+  const energySavings = metrics.energySaved;
+  const predictionAccuracy = cluster ? clamp(cluster.prediction_confidence, 0, 100) : 0;
 
   const heatmapRows = useMemo(
     () =>
       racks.map((rack) => {
-        const current = healthScoreFor(rack);
-        const history = buildTrend(current, 10).map((value) => clamp(value, 5, 99));
+        const history = forecastSeries(rack.healthScore, rack.forecast.map((p) => ({ horizon_seconds: p.horizon_seconds, value: p.predicted_health }))).map(
+          (value) => clamp(value, 0, 100),
+        );
         return { rack, history };
       }),
     [racks],
   );
+
+  if (isLoading) return <LoadingState />;
 
   return (
     <div className="relative mx-auto flex w-full max-w-[1700px] flex-1 px-3 pb-10 pt-3 sm:px-5 lg:px-8">
@@ -170,15 +180,15 @@ export default function AnalyticsWorkspace() {
           >
             <div className="flex flex-wrap items-end justify-between gap-4">
               <div>
-                <p className="text-[0.62rem] uppercase tracking-[0.24em] text-white/48">Thermal Trend</p>
+                <p className="text-[0.62rem] uppercase tracking-[0.24em] text-white/48">Thermal Forecast</p>
                 <div className="mt-2 flex items-end gap-2">
                   <span className="text-[2.8rem] font-semibold leading-none tracking-tight text-white">
                     <AnimatedValue value={`${metrics.avgTemperature.toFixed(1)}°C`} />
                   </span>
-                  <span className="pb-1.5 text-[0.78rem] text-white/48">avg across cluster</span>
+                  <span className="pb-1.5 text-[0.78rem] text-white/48">avg across cluster, now</span>
                 </div>
               </div>
-              <p className="max-w-[20rem] text-right text-[0.76rem] leading-relaxed text-white/50">Trailing telemetry window, updating live as the current scenario evolves.</p>
+              <p className="max-w-[20rem] text-right text-[0.76rem] leading-relaxed text-white/50">Real predicted temperature at each forecast horizon, from the current reading.</p>
             </div>
 
             <div
@@ -273,12 +283,12 @@ export default function AnalyticsWorkspace() {
               value={efficiencyScore}
               display={`${efficiencyScore.toFixed(0)}%`}
               tone="rgba(179,149,255,0.95)"
-              detail="Composite of cluster health and energy savings — how well compute is matched to demand right now."
+              detail="Composite of overall cluster health and cooling efficiency — how well cooling is matched to thermal load right now."
             />
             <RingStat
               label="Energy Savings"
-              value={metrics.energySaved}
-              display={`${metrics.energySaved.toFixed(1)}%`}
+              value={energySavings}
+              display={`${energySavings.toFixed(1)}%`}
               tone="rgba(120,235,190,0.95)"
               detail="Power saved versus a static, always-on baseline configuration."
             />
@@ -287,7 +297,7 @@ export default function AnalyticsWorkspace() {
               value={predictionAccuracy}
               display={`${predictionAccuracy.toFixed(0)}%`}
               tone="rgba(126,173,255,0.95)"
-              detail="Model confidence on the current telemetry read, from the same engine driving AI Copilot."
+              detail="The forecasting engine's own confidence in its current cluster-wide prediction."
             />
           </div>
 
@@ -298,16 +308,16 @@ export default function AnalyticsWorkspace() {
               transition={{ type: "spring", stiffness: 260, damping: 24 }}
               className="rounded-[1.8rem] border border-white/8 bg-[linear-gradient(165deg,rgba(22,14,52,0.78),rgba(10,8,28,0.86))] p-6 shadow-[0_18px_48px_rgba(0,0,0,0.32)] sm:p-7"
             >
-              <p className="text-[0.62rem] uppercase tracking-[0.24em] text-white/48">Rack Health Heatmap</p>
-              <p className="mt-1 text-[0.78rem] text-white/50">Trailing health score per rack — greener is cooler and steadier.</p>
+              <p className="text-[0.62rem] uppercase tracking-[0.24em] text-white/48">Rack Health Forecast</p>
+              <p className="mt-1 text-[0.78rem] text-white/50">Real predicted health score per rack, now through the forecast horizon — greener is cooler and steadier.</p>
 
               <div className="mt-5 space-y-2.5">
                 {heatmapRows.map(({ rack, history }) => (
                   <div key={rack.id} className="flex items-center gap-3">
                     <p className="w-14 shrink-0 text-[0.68rem] font-medium text-white/72">{rack.name}</p>
-                    <div className="grid flex-1 grid-cols-10 gap-1">
+                    <div className="grid flex-1 gap-1" style={{ gridTemplateColumns: `repeat(${history.length}, minmax(0, 1fr))` }}>
                       {history.map((score, index) => {
-                        const cellScore = index === history.length - 1 ? healthScoreFor(rack) : Math.round(score);
+                        const cellScore = index === 0 ? Math.round(rack.healthScore) : Math.round(score);
                         return (
                           <motion.div
                             key={index}
@@ -323,7 +333,7 @@ export default function AnalyticsWorkspace() {
                       })}
                     </div>
                     <span className="w-9 shrink-0 text-right text-[0.68rem] tabular-nums text-white/56">
-                      <AnimatedValue value={`${healthScoreFor(rack)}`} />
+                      <AnimatedValue value={`${Math.round(rack.healthScore)}`} />
                     </span>
                   </div>
                 ))}

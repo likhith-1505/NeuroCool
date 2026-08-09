@@ -1,69 +1,80 @@
 import { useEffect, useMemo, useState } from "react";
 import AIPanel from "./AIPanel";
 import ClusterCanvas, { type ClusterRack } from "./ClusterCanvas";
+import LoadingState from "./components/LoadingState";
+import { executeButtonProps, handleExecuteClick, useExecuteRecommendation } from "./lib/useExecuteRecommendation";
 import MetricsRibbon from "./MetricsRibbon";
-import Timeline from "./Timeline";
 import { SCENARIOS, mostAffectedRackId, useScenarioEngine, type ScenarioRack } from "./scenario/ScenarioEngine";
-
-const CONNECTIONS: Record<string, string[]> = {
-  r1: ["r2", "r4"],
-  r2: ["r1", "r3", "r4"],
-  r3: ["r2", "r4"],
-  r4: ["r1", "r2", "r3"],
-};
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
-
-function healthScoreFor(rack: ScenarioRack): number {
-  return Math.round(clamp(100 - (rack.temperature - 55) * 1.6 - (rack.gpu - 45) * 0.35, 20, 99));
-}
+import Timeline from "./Timeline";
 
 function toClusterRacks(racks: ScenarioRack[]): ClusterRack[] {
-  return racks.map((rack) => {
-    const health = healthScoreFor(rack);
-    return {
-      id: rack.id,
-      rackName: rack.name,
-      temperature: rack.temperature,
-      health,
-      healthScore: health,
-      gpuLoad: rack.gpu,
-      prediction: rack.prediction,
-      predictionIndicator: rack.prediction,
-      connections: CONNECTIONS[rack.id],
-    };
-  });
+  // ClusterCanvas derives nearest-neighbor links itself when `connections`
+  // is omitted (see ClusterCanvas.tsx) — real racks have no backend notion
+  // of physical adjacency, so that fallback is used rather than a
+  // hardcoded id table that would no longer match real rack ids.
+  return racks.map((rack) => ({
+    id: rack.id,
+    rackName: rack.name,
+    temperature: rack.temperature,
+    health: rack.healthScore,
+    healthScore: rack.healthScore,
+    healthState: rack.healthState,
+    gpuLoad: rack.gpu,
+    prediction: rack.prediction,
+    predictionIndicator: rack.prediction,
+  }));
 }
 
 export default function MissionControlPage() {
-  const { racks: engineRacks, scenario, ai, metrics, timelineEvents, pulseKey } = useScenarioEngine();
-  const [focusedRackId, setFocusedRackId] = useState(engineRacks[0].id);
+  const { racks: engineRacks, scenario, ai, metrics, timelineEvents, pulseKey, isLoading, scenarioError } = useScenarioEngine();
+  const [focusedRackId, setFocusedRackId] = useState<string | null>(null);
+  const executionFlow = useExecuteRecommendation();
 
   const racks = useMemo(() => toClusterRacks(engineRacks), [engineRacks]);
 
   useEffect(() => {
+    if (engineRacks.length > 0 && focusedRackId == null) setFocusedRackId(engineRacks[0].id);
+  }, [engineRacks, focusedRackId]);
+
+  useEffect(() => {
     if (!pulseKey) return;
-    if (scenario !== "thermal-spike" && scenario !== "cooling-failure") return;
+    if (scenario !== "thermal_spike" && scenario !== "cooling_failure") return;
     setFocusedRackId(mostAffectedRackId(engineRacks));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pulseKey]);
+
+  useEffect(() => {
+    executionFlow.reset();
+    // Ask NeuroCore fresh each time the recommended decision changes —
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ai.decision?.id]);
 
   const focusedRack = useMemo(
     () => racks.find((rack) => rack.id === focusedRackId) ?? racks[0],
     [focusedRackId, racks],
   );
 
+  if (isLoading || !focusedRack) {
+    return <LoadingState />;
+  }
+
+  const executeProps = executeButtonProps(executionFlow.state);
+
   return (
     <div className="relative mx-auto flex w-full max-w-[1700px] flex-1 px-3 pb-36 pt-3 sm:px-5 lg:px-8">
       <div className="relative w-full overflow-hidden rounded-[2.2rem] bg-[linear-gradient(170deg,rgba(255,255,255,0.05),rgba(255,255,255,0.012))] p-4 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.07),0_28px_90px_rgba(0,0,0,0.58)] backdrop-blur-[16px] sm:p-6 lg:p-7">
         <div className="relative flex h-full w-full flex-col gap-3">
+          {scenarioError ? (
+            <div className="rounded-xl border border-rose-300/25 bg-rose-300/[0.08] px-3 py-2 text-[0.68rem] text-rose-100/85">
+              {scenarioError}
+            </div>
+          ) : null}
+
           <MetricsRibbon
             clusterHealth={`${metrics.clusterHealth.toFixed(1)}%`}
             averageTemperature={`${metrics.avgTemperature.toFixed(1)}°C`}
-            power={`${metrics.power.toFixed(2)} MW`}
-            pue={metrics.pue.toFixed(2)}
+            power={`${metrics.power.toFixed(2)} kW`}
+            pue={metrics.pue}
             energySaved={`${metrics.energySaved.toFixed(1)}%`}
             avoidedThrottling={`${metrics.avoidedThrottling} Nodes`}
           />
@@ -71,10 +82,10 @@ export default function MissionControlPage() {
           <div className="grid h-[max(18rem,calc(100dvh_-_36rem))] gap-5 xl:grid-cols-[1.95fr_1fr]">
             <ClusterCanvas
               racks={racks}
-              focusedRackId={focusedRackId}
+              focusedRackId={focusedRackId ?? undefined}
               onRackFocus={(rack) => setFocusedRackId(rack.id)}
               className="h-full"
-              tintColor={SCENARIOS[scenario].tone.glow}
+              tintColor={SCENARIOS[scenario]?.tone.glow}
             />
 
             <AIPanel
@@ -82,7 +93,10 @@ export default function MissionControlPage() {
               reasoning={ai.reasoning}
               recommendation={ai.recommendation}
               expectedImpact={ai.impact}
-              executeLabel="Execute Recommendation"
+              executeLabel={executeProps.label}
+              executeDisabled={executeProps.disabled || !ai.decision}
+              isExecuting={executeProps.executing}
+              onExecute={() => handleExecuteClick(executionFlow.state, ai.decision, executionFlow.propose, executionFlow.confirm)}
             />
           </div>
 

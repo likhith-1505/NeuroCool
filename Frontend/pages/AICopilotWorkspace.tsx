@@ -2,27 +2,16 @@ import { AnimatePresence, motion } from "framer-motion";
 import { useEffect, useRef, useState } from "react";
 import AIPanel from "../AIPanel";
 import AnimatedValue from "../components/AnimatedValue";
-import { SCENARIOS, useScenarioEngine, type ScenarioAi, type ScenarioId, type ScenarioRack } from "../scenario/ScenarioEngine";
+import LoadingState from "../components/LoadingState";
+import { apiClient } from "../lib/apiClient";
+import { streamChat, StreamConnectionError } from "../lib/sseClient";
+import type { ActionConfirmationRequiredStreamEvent } from "../lib/types";
+import { executeButtonProps, handleExecuteClick, useExecuteRecommendation } from "../lib/useExecuteRecommendation";
+import { SCENARIOS, useScenarioEngine } from "../scenario/ScenarioEngine";
 
-const PIPELINE_STAGES = [
-  "Analyzing telemetry",
-  "Thermal prediction",
-  "GPU scheduling",
-  "Cooling optimization",
-  "Migration plan",
-  "Execution ready",
-];
+const SUGGESTED_PROMPTS = ["Why is Rack C1 at risk?", "Explain the current recommendation.", "What changed recently?", "Summarize cluster health."];
 
-const SUGGESTED_PROMPTS = ["Why is Rack C hot?", "Simulate thermal spike.", "Explain recommendation.", "Optimize cooling."];
-
-type ChatMessage = { id: string; role: "user" | "assistant"; content: string };
-
-type ChatContext = {
-  scenario: ScenarioId;
-  racks: ScenarioRack[];
-  ai: ScenarioAi;
-  selectScenario: (id: ScenarioId) => void;
-};
+type ChatMessage = { id: string; role: "user" | "assistant" | "error"; content: string };
 
 let seq = 0;
 function nextId(prefix: string): string {
@@ -34,144 +23,147 @@ function makeMessage(role: ChatMessage["role"], content: string): ChatMessage {
   return { id: nextId("m"), role, content };
 }
 
-function buildReply(promptRaw: string, ctx: ChatContext): { text: string; action?: () => void } {
-  const prompt = promptRaw.toLowerCase();
-  const rackC = ctx.racks.find((rack) => rack.id === "r3") ?? ctx.racks[0];
-
-  if (/rack\s*c/.test(prompt) && /(hot|warm|temp|heat)/.test(prompt)) {
-    if (rackC.prediction === "Critical Risk" || ctx.scenario === "thermal-spike") {
-      return {
-        text: `Rack C1 is running at ${rackC.temperature.toFixed(1)}°C with GPU load at ${rackC.gpu}% — a rapid thermal excursion was detected as compute density outpaced cooling. ${ctx.ai.recommendation}`,
-      };
-    }
-    return {
-      text: `Rack C1 is currently stable at ${rackC.temperature.toFixed(1)}°C with GPU load at ${rackC.gpu}%, well within its safe thermal envelope. No excursion detected right now.`,
-    };
-  }
-
-  if (/simulate/.test(prompt) && /thermal/.test(prompt)) {
-    return {
-      text: "Initiating a rapid thermal excursion on Rack C1 — watch temperatures climb across Mission Control and the Digital Twin in real time.",
-      action: () => ctx.selectScenario("thermal-spike"),
-    };
-  }
-
-  if (/explain/.test(prompt) && /recommend/.test(prompt)) {
-    return {
-      text: `${ctx.ai.recommendation} ${ctx.ai.impact} This is based on a ${ctx.ai.confidence}/100 confidence read on the current telemetry window.`,
-    };
-  }
-
-  if (/cool/.test(prompt) && /(optim|improve|boost)/.test(prompt)) {
-    return {
-      text: `Cooling on the hottest zone (Rack C1) is currently ${rackC.cooling.toLowerCase()}. Recommended action: increase airflow to that rack and stagger burst jobs to avoid concentrated heat. ${
-        ctx.scenario !== "normal" ? "Executing the current recommendation will help stabilize this now." : "No immediate action required — cooling is already efficient."
-      }`,
-    };
-  }
-
-  return {
-    text: `Current cluster status: ${SCENARIOS[ctx.scenario].label}. ${ctx.ai.situation} Try asking about a specific rack, or "Explain recommendation" for more detail.`,
-  };
-}
-
-function stageState(index: number, activeStage: number, complete: boolean): "idle" | "pending" | "active" | "done" {
-  if (activeStage === -1) return "idle";
-  if (complete) return "done";
-  if (index < activeStage) return "done";
-  if (index === activeStage) return "active";
-  return "pending";
-}
-
 export default function AICopilotWorkspace() {
-  const { scenario, ai, racks, selectScenario } = useScenarioEngine();
+  const { scenario, ai, racks, isLoading } = useScenarioEngine();
+  const executionFlow = useExecuteRecommendation();
 
   const [messages, setMessages] = useState<ChatMessage[]>([
-    makeMessage("assistant", "I'm watching telemetry across all four racks. Ask me anything, or try a suggestion below."),
-    makeMessage("user", "Why is Rack C hot?"),
-    makeMessage(
-      "assistant",
-      "Rack C1 is currently stable, well within its safe thermal envelope. No excursion detected right now — I'll flag it immediately if that changes.",
-    ),
-    makeMessage("user", "What should I watch for next?"),
-    makeMessage(
-      "assistant",
-      "Keep an eye on GPU utilization during burst windows — that's the leading indicator before any thermal drift shows up here.",
-    ),
+    makeMessage("assistant", "Ask me about a rack, the active scenario, or the current recommendation — I read real cluster telemetry, not a script."),
   ]);
   const [draft, setDraft] = useState("");
-  const [isThinking, setIsThinking] = useState(false);
-  const [activeStage, setActiveStage] = useState(-1);
-  const [pipelineComplete, setPipelineComplete] = useState(false);
-  const [isExecuting, setIsExecuting] = useState(false);
-  const pipelineGuard = useRef(0);
+  const [isStreaming, setIsStreaming] = useState(false);
+  // High-level operational status for the current turn only (see
+  // app/schemas/ai_stream.py's ThinkingEvent/ToolStartedEvent/
+  // ToolCompletedEvent) — reset every turn, never the model's private
+  // reasoning, only the fixed vocabulary the backend itself emits.
+  const [activity, setActivity] = useState<string[]>([]);
+  const [pendingConfirmation, setPendingConfirmation] = useState<ActionConfirmationRequiredStreamEvent | null>(null);
+  const [confirmationBusy, setConfirmationBusy] = useState(false);
+  const conversationIdRef = useRef<string | undefined>(undefined);
+  const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, isThinking]);
+  }, [messages, isStreaming, pendingConfirmation]);
 
-  function runPipeline(onDone: () => void) {
-    const token = ++pipelineGuard.current;
-    setPipelineComplete(false);
-    setActiveStage(0);
-
-    let i = 0;
-    function step() {
-      if (pipelineGuard.current !== token) return;
-      if (i >= PIPELINE_STAGES.length - 1) {
-        setPipelineComplete(true);
-        onDone();
-        return;
-      }
-      i += 1;
-      setActiveStage(i);
-      window.setTimeout(step, 480);
-    }
-    window.setTimeout(step, 480);
-  }
-
-  function handleExecute() {
-    if (isExecuting) return;
-    setIsExecuting(true);
-    const wasIdle = scenario === "normal";
-    runPipeline(() => {
-      if (!wasIdle) selectScenario("normal");
-      setIsExecuting(false);
-      setMessages((current) =>
-        [
-          ...current,
-          makeMessage(
-            "assistant",
-            wasIdle
-              ? "Execution complete. Workload distribution confirmed optimal — no changes needed."
-              : "Execution complete. Cluster restored to nominal operating range.",
-          ),
-        ].slice(-30),
-      );
-    });
-  }
+  useEffect(() => {
+    return () => abortRef.current?.abort();
+  }, []);
 
   function sendPrompt(text: string) {
     const trimmed = text.trim();
-    if (!trimmed || isThinking) return;
+    if (!trimmed || isStreaming) return;
 
-    setMessages((current) => [...current, makeMessage("user", trimmed)].slice(-30));
+    // A new turn always supersedes any in-flight one — never leaves an
+    // orphaned stream running in the background (see the objective's
+    // cancellation requirements).
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    setMessages((current) => [...current, makeMessage("user", trimmed)]);
     setDraft("");
-    setIsThinking(true);
+    setIsStreaming(true);
+    setActivity([]);
+    setPendingConfirmation(null);
 
-    const { text: reply, action } = buildReply(trimmed, { scenario, racks, ai, selectScenario });
+    const assistantId = nextId("m");
+    let assistantText = "";
+    let sawText = false;
+    let sawConfirmation = false;
 
-    window.setTimeout(() => {
-      setIsThinking(false);
-      setMessages((current) => [...current, makeMessage("assistant", reply)].slice(-30));
-      action?.();
-    }, 700);
+    setMessages((current) => [...current, { id: assistantId, role: "assistant", content: "" }]);
+
+    streamChat(
+      { message: trimmed, conversation_id: conversationIdRef.current },
+      {
+        signal: controller.signal,
+        onEvent: (event) => {
+          if (event.type === "thinking") {
+            setActivity((current) => [...current, event.message]);
+          } else if (event.type === "tool_started") {
+            setActivity((current) => [...current, `Running ${event.tool}…`]);
+          } else if (event.type === "tool_completed") {
+            setActivity((current) => [...current, event.ok ? `${event.tool} complete.` : `${event.tool} failed.`]);
+          } else if (event.type === "text_delta") {
+            sawText = true;
+            assistantText += event.text;
+            const snapshot = assistantText;
+            setMessages((current) => current.map((m) => (m.id === assistantId ? { ...m, content: snapshot } : m)));
+          } else if (event.type === "action_confirmation_required") {
+            sawConfirmation = true;
+            setPendingConfirmation(event);
+          } else if (event.type === "completed") {
+            conversationIdRef.current = event.conversation_id;
+          } else if (event.type === "error") {
+            const message = event.message;
+            setMessages((current) => current.map((m) => (m.id === assistantId ? { ...m, role: "error", content: message } : m)));
+          }
+        },
+      },
+    )
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        const message =
+          error instanceof StreamConnectionError || error instanceof Error ? error.message : "The AI stream failed unexpectedly.";
+        setMessages((current) => current.map((m) => (m.id === assistantId ? { ...m, role: "error", content: message } : m)));
+      })
+      .finally(() => {
+        if (controller.signal.aborted) return;
+        // A tool-only turn that ended in an action proposal never produced
+        // narration text — drop the empty placeholder bubble rather than
+        // show a blank assistant message.
+        if (!sawText && sawConfirmation) {
+          setMessages((current) => current.filter((m) => m.id !== assistantId));
+        }
+        setIsStreaming(false);
+        if (abortRef.current === controller) abortRef.current = null;
+      });
   }
 
+  async function confirmPendingAction() {
+    if (!pendingConfirmation) return;
+    const { action_id } = pendingConfirmation;
+    setConfirmationBusy(true);
+    try {
+      const action = await apiClient.confirmAction(action_id);
+      setMessages((current) => [
+        ...current,
+        action.status === "completed"
+          ? makeMessage("assistant", `Execution completed.${action.execution_id ? ` (execution ${action.execution_id})` : ""}`)
+          : makeMessage("error", action.error_message ?? `Execution ended in status: ${action.status}.`),
+      ]);
+    } catch (error) {
+      setMessages((current) => [...current, makeMessage("error", error instanceof Error ? error.message : "Confirmation request failed.")]);
+    } finally {
+      setConfirmationBusy(false);
+      setPendingConfirmation(null);
+    }
+  }
+
+  async function cancelPendingAction() {
+    if (!pendingConfirmation) return;
+    const { action_id } = pendingConfirmation;
+    setConfirmationBusy(true);
+    try {
+      await apiClient.cancelAction(action_id);
+      setMessages((current) => [...current, makeMessage("assistant", "Action cancelled — nothing was executed.")]);
+    } catch (error) {
+      setMessages((current) => [...current, makeMessage("error", error instanceof Error ? error.message : "Cancellation request failed.")]);
+    } finally {
+      setConfirmationBusy(false);
+      setPendingConfirmation(null);
+    }
+  }
+
+  if (isLoading) return <LoadingState />;
+
   const focusedRack = racks.reduce((hottest, rack) => (rack.temperature > hottest.temperature ? rack : hottest), racks[0]);
+  const executeProps = executeButtonProps(executionFlow.state);
+  const pipelineStatus = isStreaming ? "Running…" : activity.length > 0 ? "Last run complete" : "Idle";
 
   return (
     <div className="relative mx-auto flex w-full max-w-[1700px] flex-1 px-3 pb-10 pt-3 sm:px-5 lg:px-8">
@@ -179,10 +171,6 @@ export default function AICopilotWorkspace() {
         @keyframes chat-typing-bounce {
           0%, 60%, 100% { transform: translateY(0); opacity: 0.5; }
           30% { transform: translateY(-3px); opacity: 1; }
-        }
-        @keyframes pipeline-connector-flow {
-          0% { background-position: 0% 0%; }
-          100% { background-position: 200% 0%; }
         }
       `}</style>
 
@@ -198,7 +186,7 @@ export default function AICopilotWorkspace() {
               <span className="relative inline-flex h-2 w-2 rounded-full" style={{ background: "rgba(var(--accent-rgb),1)", boxShadow: "0 0 12px rgba(var(--accent-rgb),0.88)" }} />
             </span>
             <span className="text-[0.56rem] uppercase tracking-[0.16em] text-white/66">
-              Scenario: <AnimatedValue value={SCENARIOS[scenario].label} />
+              Scenario: <AnimatedValue value={SCENARIOS[scenario]?.label ?? scenario} />
             </span>
           </div>
         </div>
@@ -206,49 +194,41 @@ export default function AICopilotWorkspace() {
         <div className="grid h-[max(38rem,calc(100dvh_-_16rem))] gap-5 xl:grid-cols-[1.7fr_1fr]">
           {/* Main column: reasoning pipeline + conversation */}
           <div className="flex min-h-0 flex-col gap-4">
-            {/* Reasoning pipeline */}
+            {/* Reasoning activity — the real, high-level ThinkingEvent/tool
+                trail for the current turn (never the model's hidden
+                chain-of-thought — see backend/app/schemas/ai_stream.py). */}
             <div className="shrink-0 rounded-[1.4rem] border border-white/8 bg-white/[0.025] p-3.5">
               <div className="mb-2.5 flex items-center justify-between px-0.5">
-                <p className="text-[0.5rem] uppercase tracking-[0.22em] text-white/44">Reasoning Pipeline</p>
-                <p className="text-[0.5rem] uppercase tracking-[0.14em] text-white/34">
-                  {isExecuting ? "Running…" : pipelineComplete ? "Last run complete" : "Idle"}
-                </p>
+                <p className="text-[0.5rem] uppercase tracking-[0.22em] text-white/44">NeuroCore Activity</p>
+                <p className="text-[0.5rem] uppercase tracking-[0.14em] text-white/34">{pipelineStatus}</p>
               </div>
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
-                {PIPELINE_STAGES.map((label, index) => {
-                  const state = stageState(index, activeStage, pipelineComplete);
-                  return (
-                    <div
-                      key={label}
-                      className={`relative overflow-hidden rounded-xl border px-2.5 py-2 transition-colors duration-300 ${
-                        state === "done"
-                          ? "border-emerald-300/25 bg-emerald-300/[0.08]"
-                          : state === "active"
-                            ? "border-violet-300/40 bg-violet-300/[0.14]"
-                            : "border-white/8 bg-white/[0.02]"
-                      }`}
-                    >
-                      {state === "active" ? (
-                        <span
-                          className="pointer-events-none absolute inset-0"
-                          style={{ boxShadow: "0 0 20px rgba(167,129,255,0.55)", animation: "dock-glow-pulse 1.3s ease-in-out infinite" }}
-                        />
-                      ) : null}
-                      <div className="relative z-10 flex items-start gap-1.5">
-                        <span
-                          className={`mt-px flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full text-[0.5rem] font-semibold ${
-                            state === "done" ? "bg-emerald-300 text-[#0a1a12]" : state === "active" ? "bg-violet-300 text-[#0a0618]" : "bg-white/12 text-white/50"
-                          }`}
-                        >
-                          {state === "done" ? "✓" : index + 1}
-                        </span>
-                        <p className={`min-w-0 text-[0.58rem] font-medium leading-tight ${state === "pending" || state === "idle" ? "text-white/40" : "text-white/88"}`}>
-                          {label}
-                        </p>
-                      </div>
-                    </div>
-                  );
-                })}
+              <div className="flex flex-wrap gap-2">
+                {activity.length === 0 ? (
+                  <span className="rounded-xl border border-white/8 bg-white/[0.02] px-2.5 py-2 text-[0.58rem] text-white/40">
+                    No activity yet — ask a question to begin.
+                  </span>
+                ) : (
+                  activity.map((label, index) => {
+                    const isLast = index === activity.length - 1;
+                    const active = isLast && isStreaming;
+                    return (
+                      <span
+                        key={`${index}-${label}`}
+                        className={`relative overflow-hidden rounded-xl border px-2.5 py-2 text-[0.58rem] font-medium transition-colors duration-300 ${
+                          active ? "border-violet-300/40 bg-violet-300/[0.14] text-white/90" : "border-emerald-300/20 bg-emerald-300/[0.06] text-white/72"
+                        }`}
+                      >
+                        {active ? (
+                          <span
+                            className="pointer-events-none absolute inset-0"
+                            style={{ boxShadow: "0 0 20px rgba(167,129,255,0.55)", animation: "dock-glow-pulse 1.3s ease-in-out infinite" }}
+                          />
+                        ) : null}
+                        <span className="relative z-10">{label}</span>
+                      </span>
+                    );
+                  })
+                )}
               </div>
             </div>
 
@@ -259,45 +239,53 @@ export default function AICopilotWorkspace() {
                   <p className="text-[0.5rem] uppercase tracking-[0.22em] text-white/44">Conversation</p>
                   <p className="mt-0.5 text-[0.86rem] font-medium text-white">NeuroCore Copilot</p>
                 </div>
-                <span className="flex h-7 w-7 items-center justify-center rounded-full text-[0.62rem] font-semibold" style={{ background: SCENARIOS[scenario].tone.ring, color: "#0a0618" }}>
+                <span className="flex h-7 w-7 items-center justify-center rounded-full text-[0.62rem] font-semibold" style={{ background: SCENARIOS[scenario]?.tone.ring, color: "#0a0618" }}>
                   AI
                 </span>
               </div>
 
               <div ref={scrollRef} className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4">
                 <AnimatePresence initial={false}>
-                  {messages.map((message) => (
-                    <motion.div
-                      key={message.id}
-                      initial={{ opacity: 0, y: 10, filter: "blur(4px)" }}
-                      animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
-                      transition={{ duration: 0.32, ease: [0.2, 0.8, 0.2, 1] }}
-                      className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
-                    >
-                      {message.role === "assistant" ? (
-                        <div className="flex max-w-[85%] items-start gap-2">
-                          <span
-                            className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[0.44rem] font-semibold"
-                            style={{ background: SCENARIOS[scenario].tone.ring, color: "#0a0618" }}
-                          >
-                            AI
-                          </span>
-                          <p className="rounded-2xl rounded-tl-sm border border-white/8 bg-white/[0.035] px-3.5 py-2.5 text-[0.82rem] leading-relaxed text-white/86">
+                  {messages
+                    .filter((message) => message.content.length > 0 || message.role === "user")
+                    .map((message) => (
+                      <motion.div
+                        key={message.id}
+                        initial={{ opacity: 0, y: 10, filter: "blur(4px)" }}
+                        animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                        transition={{ duration: 0.32, ease: [0.2, 0.8, 0.2, 1] }}
+                        className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
+                      >
+                        {message.role === "assistant" || message.role === "error" ? (
+                          <div className="flex max-w-[85%] items-start gap-2">
+                            <span
+                              className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[0.44rem] font-semibold"
+                              style={{ background: message.role === "error" ? "rgba(255,110,148,0.9)" : SCENARIOS[scenario]?.tone.ring, color: "#0a0618" }}
+                            >
+                              AI
+                            </span>
+                            <p
+                              className={`rounded-2xl rounded-tl-sm border px-3.5 py-2.5 text-[0.82rem] leading-relaxed ${
+                                message.role === "error"
+                                  ? "border-rose-300/25 bg-rose-300/[0.08] text-rose-100/90"
+                                  : "border-white/8 bg-white/[0.035] text-white/86"
+                              }`}
+                            >
+                              {message.content}
+                            </p>
+                          </div>
+                        ) : (
+                          <p className="max-w-[85%] rounded-2xl rounded-tr-sm bg-[linear-gradient(120deg,rgba(137,104,255,0.4),rgba(107,127,255,0.34))] px-3.5 py-2.5 text-[0.82rem] leading-relaxed text-white">
                             {message.content}
                           </p>
-                        </div>
-                      ) : (
-                        <p className="max-w-[85%] rounded-2xl rounded-tr-sm bg-[linear-gradient(120deg,rgba(137,104,255,0.4),rgba(107,127,255,0.34))] px-3.5 py-2.5 text-[0.82rem] leading-relaxed text-white">
-                          {message.content}
-                        </p>
-                      )}
-                    </motion.div>
-                  ))}
+                        )}
+                      </motion.div>
+                    ))}
                 </AnimatePresence>
 
-                {isThinking ? (
+                {isStreaming ? (
                   <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex items-center gap-2">
-                    <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[0.44rem] font-semibold" style={{ background: SCENARIOS[scenario].tone.ring, color: "#0a0618" }}>
+                    <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[0.44rem] font-semibold" style={{ background: SCENARIOS[scenario]?.tone.ring, color: "#0a0618" }}>
                       AI
                     </span>
                     <div className="flex items-center gap-1 rounded-2xl rounded-tl-sm border border-white/8 bg-white/[0.035] px-3.5 py-3">
@@ -308,6 +296,35 @@ export default function AICopilotWorkspace() {
                           style={{ animation: `chat-typing-bounce 1.1s ease-in-out ${dot * 0.15}s infinite` }}
                         />
                       ))}
+                    </div>
+                  </motion.div>
+                ) : null}
+
+                {pendingConfirmation ? (
+                  <motion.div
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="rounded-2xl border border-amber-300/25 bg-amber-300/[0.08] px-3.5 py-3"
+                  >
+                    <p className="text-[0.5rem] uppercase tracking-[0.2em] text-amber-100/70">Confirmation Required</p>
+                    <p className="mt-1 text-[0.8rem] leading-relaxed text-white/88">{pendingConfirmation.summary}</p>
+                    <div className="mt-2.5 flex gap-2">
+                      <button
+                        type="button"
+                        disabled={confirmationBusy}
+                        onClick={confirmPendingAction}
+                        className="rounded-lg border border-emerald-300/30 bg-emerald-300/[0.12] px-3 py-1.5 text-[0.62rem] uppercase tracking-[0.1em] text-emerald-100/90 transition hover:bg-emerald-300/[0.2] disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {confirmationBusy ? "Working…" : "Confirm"}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={confirmationBusy}
+                        onClick={cancelPendingAction}
+                        className="rounded-lg border border-white/12 bg-white/[0.04] px-3 py-1.5 text-[0.62rem] uppercase tracking-[0.1em] text-white/70 transition hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        Cancel
+                      </button>
                     </div>
                   </motion.div>
                 ) : null}
@@ -323,7 +340,7 @@ export default function AICopilotWorkspace() {
                         setDraft(prompt);
                         inputRef.current?.focus();
                       }}
-                      disabled={isThinking}
+                      disabled={isStreaming}
                       className="rounded-full border border-white/10 bg-white/[0.03] px-2.5 py-1 text-[0.62rem] text-white/68 transition duration-300 hover:-translate-y-[1px] hover:border-[rgba(var(--accent-rgb),0.3)] hover:bg-[rgba(var(--accent-rgb),0.12)] hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       {prompt}
@@ -347,7 +364,7 @@ export default function AICopilotWorkspace() {
                   />
                   <motion.button
                     type="submit"
-                    disabled={!draft.trim() || isThinking}
+                    disabled={!draft.trim() || isStreaming}
                     whileHover={{ scale: 1.04 }}
                     whileTap={{ scale: 0.96 }}
                     style={{ borderColor: "rgba(var(--accent-rgb),0.24)", background: "linear-gradient(120deg, rgba(var(--accent-rgb),0.46), rgba(107,127,255,0.4))" }}
@@ -370,9 +387,10 @@ export default function AICopilotWorkspace() {
               reasoning={ai.reasoning}
               recommendation={ai.recommendation}
               expectedImpact={ai.impact}
-              onExecute={handleExecute}
-              isExecuting={isExecuting}
-              executeLabel="Execute Recommendation"
+              onExecute={() => handleExecuteClick(executionFlow.state, ai.decision, executionFlow.propose, executionFlow.confirm)}
+              isExecuting={executeProps.executing}
+              executeDisabled={executeProps.disabled || !ai.decision}
+              executeLabel={executeProps.label}
               className="flex-1"
             />
 

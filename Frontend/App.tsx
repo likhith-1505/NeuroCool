@@ -12,6 +12,7 @@ import DigitalTwinWorkspace from "./pages/DigitalTwinWorkspace";
 import SettingsWorkspace from "./pages/SettingsWorkspace";
 import { SCENARIOS, useScenarioEngine, type ScenarioId } from "./scenario/ScenarioEngine";
 import { useSettings } from "./settings/SettingsContext";
+import { useTelemetry } from "./state/TelemetryContext";
 
 const commands: CommandItem[] = [
   { id: "open-mission", label: "Open Mission Control", hint: "Navigation" },
@@ -23,6 +24,7 @@ const commands: CommandItem[] = [
   { id: "scenario-training-burst", label: "Scenario: Training Burst", hint: "Scenario" },
   { id: "scenario-thermal-spike", label: "Scenario: Thermal Spike", hint: "Scenario" },
   { id: "scenario-cooling-failure", label: "Scenario: Cooling Failure", hint: "Scenario" },
+  { id: "scenario-power-surge", label: "Scenario: Power Surge", hint: "Scenario" },
   { id: "replay", label: "Replay Scenario Sequence", hint: "Scenario" },
   { id: "reset", label: "Reset Cluster", hint: "Scenario" },
   { id: "search-rack", label: "Search Rack", hint: "Search" },
@@ -40,9 +42,10 @@ function routeToPath(commandId: string): string | null {
 
 function commandToScenario(commandId: string): ScenarioId | null {
   if (commandId === "scenario-normal") return "normal";
-  if (commandId === "scenario-training-burst") return "training-burst";
-  if (commandId === "scenario-thermal-spike") return "thermal-spike";
-  if (commandId === "scenario-cooling-failure") return "cooling-failure";
+  if (commandId === "scenario-training-burst") return "training_burst";
+  if (commandId === "scenario-thermal-spike") return "thermal_spike";
+  if (commandId === "scenario-cooling-failure") return "cooling_failure";
+  if (commandId === "scenario-power-surge") return "power_surge";
   return null;
 }
 
@@ -51,6 +54,7 @@ export default function App() {
   const navigate = useNavigate();
   const { scenario, selectScenario, triggerReplay, resetScenario } = useScenarioEngine();
   const { theme, setTheme, motion: motionMode } = useSettings();
+  const { status: connectionStatus } = useTelemetry();
 
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [lastSearchLabel, setLastSearchLabel] = useState("");
@@ -124,6 +128,7 @@ export default function App() {
         <WorkspaceNav
           clusterStatus={clusterStatus}
           theme={theme}
+          connectionStatus={connectionStatus}
           onToggleTheme={() => setTheme(theme === "dark" ? "light" : "dark")}
           onOpenPalette={() => setPaletteOpen(true)}
         />

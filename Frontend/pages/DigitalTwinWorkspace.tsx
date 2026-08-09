@@ -1,7 +1,8 @@
 import { AnimatePresence, motion, useMotionValue } from "framer-motion";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import AnimatedValue from "../components/AnimatedValue";
-import { SCENARIOS, mostAffectedRackId, useScenarioEngine, type ScenarioRack } from "../scenario/ScenarioEngine";
+import LoadingState from "../components/LoadingState";
+import { nearestForecastPoint, SCENARIOS, mostAffectedRackId, useScenarioEngine, type ScenarioRack } from "../scenario/ScenarioEngine";
 
 type TwinRack = ScenarioRack;
 
@@ -11,15 +12,31 @@ type Camera = { scale: number; x: number; y: number };
 type LiveDrag = { id: string; x: number; y: number };
 type Position = { x: number; y: number };
 
-const links: Array<[string, string]> = [
-  ["r1", "r2"],
-  ["r2", "r3"],
-  ["r3", "r4"],
-  ["r4", "r1"],
-  ["r2", "r4"],
-];
-
 const DEFAULT_CAMERA: Camera = { scale: 1, x: 0, y: 0 };
+
+/** Real racks have no backend notion of physical adjacency (unlike the
+ * original hardcoded r1/r2/r3/r4 link table, which no longer matches real
+ * rack ids) — nearest-neighbor-by-position is a reasonable, stable stand-
+ * in, computed once per rack-id-set rather than invented telemetry.
+ */
+function computeDefaultLinks(racks: TwinRack[]): Array<[string, string]> {
+  const dedupe = new Set<string>();
+  const links: Array<[string, string]> = [];
+  racks.forEach((rack) => {
+    const nearest = racks
+      .filter((candidate) => candidate.id !== rack.id)
+      .map((candidate) => ({ id: candidate.id, distance: Math.hypot(rack.x - candidate.x, rack.y - candidate.y) }))
+      .sort((a, b) => a.distance - b.distance)
+      .slice(0, Math.min(2, Math.max(1, racks.length - 1)));
+    nearest.forEach(({ id }) => {
+      const key = [rack.id, id].sort().join(":");
+      if (dedupe.has(key)) return;
+      dedupe.add(key);
+      links.push([rack.id, id]);
+    });
+  });
+  return links;
+}
 
 const HEALTH_TONE: Record<HealthState, Tone> = {
   healthy: {
@@ -52,33 +69,36 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+// Every stat below reads a real backend field directly (health_score,
+// cooling_efficiency) or the nearest real forecast point (predicted_risk,
+// confidence) — see ScenarioEngine's mapping — rather than re-deriving a
+// synthetic value from temperature the way the original mock did.
+
 function healthState(rack: TwinRack): HealthState {
-  if (rack.prediction === "Critical Risk" || rack.temperature >= 83) return "critical";
-  if (rack.prediction === "Watch" || rack.temperature >= 75) return "warning";
-  return "healthy";
+  return rack.healthState;
 }
 
 function predictionConfidence(rack: TwinRack): number {
-  if (rack.prediction === "Critical Risk") return 96;
-  if (rack.prediction === "Watch") return 82;
-  return 91;
+  const point = nearestForecastPoint(rack.forecast);
+  return point ? Math.round(point.confidence) : Math.round(rack.healthScore);
 }
 
 function thermalHealth(rack: TwinRack): number {
-  return clamp(Math.round(100 - (rack.temperature - 55) * 2.1), 4, 99);
+  return clamp(Math.round(rack.healthScore), 0, 100);
 }
 
 function coolingEfficiency(rack: TwinRack): number {
-  if (rack.cooling === "Optimal") return clamp(Math.round(92 - (rack.temperature - 65)), 68, 96);
-  if (rack.cooling === "Elevated") return clamp(Math.round(64 - (rack.temperature - 74)), 40, 68);
-  return clamp(Math.round(38 - (rack.temperature - 80)), 12, 40);
+  return clamp(Math.round(rack.coolingEfficiency), 0, 100);
 }
 
 function estimatedRisk(rack: TwinRack): number {
-  const state = healthState(rack);
-  if (state === "critical") return clamp(Math.round(78 + (rack.temperature - 83) * 2), 70, 99);
-  if (state === "warning") return clamp(Math.round(38 + (rack.temperature - 75) * 2.4), 30, 68);
-  return clamp(Math.round(8 + (rack.temperature - 58) * 0.6), 3, 28);
+  const point = nearestForecastPoint(rack.forecast);
+  if (point) return clamp(Math.round(point.predicted_risk), 0, 100);
+  // No forecast yet (e.g. the very first tick) — fall back to the same
+  // three-tier bucket the backend itself uses for prediction_state.
+  if (rack.healthState === "critical") return 85;
+  if (rack.healthState === "warning") return 50;
+  return 12;
 }
 
 function riskLabel(risk: number): string {
@@ -407,6 +427,16 @@ function riskColor(risk: number): string {
 }
 
 export default function DigitalTwinWorkspace() {
+  const { isLoading } = useScenarioEngine();
+  // Hooks below assume at least one rack — split into a child component
+  // (mounted only once real telemetry has arrived) rather than an early
+  // return mid-function, which would otherwise call a different number of
+  // hooks between the loading and loaded renders.
+  if (isLoading) return <LoadingState />;
+  return <DigitalTwinCanvas />;
+}
+
+function DigitalTwinCanvas() {
   const { racks: engineRacks, scenario, pulseKey, resetToken } = useScenarioEngine();
   const containerRef = useRef<HTMLDivElement>(null);
   const [dragOverrides, setDragOverrides] = useState<Record<string, Position>>({});
@@ -429,10 +459,12 @@ export default function DigitalTwinWorkspace() {
 
   useEffect(() => {
     if (!pulseKey) return;
-    if (scenario !== "thermal-spike" && scenario !== "cooling-failure") return;
+    if (scenario !== "thermal_spike" && scenario !== "cooling_failure") return;
     setFocusedRackId(mostAffectedRackId(engineRacks));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pulseKey]);
+
+  const links = useMemo(() => computeDefaultLinks(racks), [racks]);
 
   useEffect(() => {
     const el = containerRef.current;

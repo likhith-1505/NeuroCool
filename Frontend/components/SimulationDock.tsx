@@ -9,10 +9,11 @@ type Control =
 
 const CONTROLS: Control[] = [
   { kind: "scenario", id: "normal", icon: "●", hint: "Return the cluster to a healthy baseline" },
-  { kind: "scenario", id: "training-burst", icon: "◎", hint: "Simulate a distributed training burst" },
-  { kind: "scenario", id: "thermal-spike", icon: "◉", hint: "Simulate a rapid thermal excursion" },
-  { kind: "scenario", id: "cooling-failure", icon: "◌", hint: "Simulate a cooling subsystem fault" },
-  { kind: "replay", icon: "↺", hint: "Replay the full incident sequence" },
+  { kind: "scenario", id: "training_burst", icon: "◎", hint: "Simulate a distributed training burst" },
+  { kind: "scenario", id: "thermal_spike", icon: "◉", hint: "Simulate a rapid thermal excursion" },
+  { kind: "scenario", id: "cooling_failure", icon: "◌", hint: "Simulate a cooling subsystem fault" },
+  { kind: "scenario", id: "power_surge", icon: "⚡", hint: "Simulate an electrical power surge" },
+  { kind: "replay", icon: "↺", hint: "Replay the most recently completed scenario" },
   { kind: "reset", icon: "⟲", hint: "Reset the cluster to baseline" },
 ];
 

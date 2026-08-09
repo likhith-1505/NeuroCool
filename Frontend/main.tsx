@@ -4,6 +4,7 @@ import { BrowserRouter } from "react-router-dom";
 import App from "./App";
 import { ScenarioEngineProvider } from "./scenario/ScenarioEngine";
 import { SettingsProvider } from "./settings/SettingsContext";
+import { TelemetryProvider } from "./state/TelemetryContext";
 import "./index.css";
 
 const container = document.getElementById("root");
@@ -16,9 +17,11 @@ createRoot(container).render(
   <StrictMode>
     <BrowserRouter>
       <SettingsProvider>
-        <ScenarioEngineProvider>
-          <App />
-        </ScenarioEngineProvider>
+        <TelemetryProvider>
+          <ScenarioEngineProvider>
+            <App />
+          </ScenarioEngineProvider>
+        </TelemetryProvider>
       </SettingsProvider>
     </BrowserRouter>
   </StrictMode>,
