@@ -5,10 +5,12 @@ for local development). Docker Compose injects the real values at runtime —
 see docker-compose.yml and .env.example.
 """
 
+import json
 from functools import lru_cache
+from typing import Annotated
 
 from pydantic import field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -26,12 +28,23 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
 
     # --- CORS ---
-    BACKEND_CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:3000"]
+    # NoDecode: pydantic-settings otherwise tries to JSON-decode any env
+    # value for a list-typed field *before* field_validator ever runs
+    # (docker-compose.yml sets this as a plain comma-separated string, per
+    # .env.example) — without it, a real (non-JSON-array) env value raises
+    # inside pydantic-settings itself, never reaching _split_cors_origins.
+    BACKEND_CORS_ORIGINS: Annotated[list[str], NoDecode] = ["http://localhost:5173", "http://localhost:3000"]
 
     @field_validator("BACKEND_CORS_ORIGINS", mode="before")
     @classmethod
     def _split_cors_origins(cls, value: object) -> object:
-        if isinstance(value, str) and not value.startswith("["):
+        # NoDecode means pydantic-settings never JSON-decodes this field
+        # itself (see the field's own comment) — a `[...]`-style env value
+        # is parsed here instead, so both a comma-separated list (the
+        # documented .env.example format) and a JSON array still work.
+        if isinstance(value, str):
+            if value.startswith("["):
+                return json.loads(value)
             return [origin.strip() for origin in value.split(",") if origin.strip()]
         return value
 
