@@ -36,7 +36,13 @@ async def lifespan(app: FastAPI):
     # See app.neurocore.providers.factory and the objective's "backend
     # must still start" requirement.
     provider = build_provider_from_settings(settings)
-    app.state.neurocore = NeuroCoreService(provider=provider, max_response_tokens=settings.AI_MAX_RESPONSE_TOKENS)
+    app.state.neurocore = NeuroCoreService(
+        provider=provider,
+        max_response_tokens=settings.AI_MAX_RESPONSE_TOKENS,
+        llm_timeout_seconds=settings.AI_REQUEST_TIMEOUT_SECONDS,
+        tool_timeout_seconds=settings.AI_TOOL_TIMEOUT_SECONDS,
+        stream_timeout_seconds=settings.AI_STREAM_TIMEOUT_SECONDS,
+    )
     if provider is None:
         logger.warning("NeuroCore: no LLM provider available (AI_PROVIDER=%s) — /api/ai/chat will report unavailable.", settings.AI_PROVIDER)
     else:

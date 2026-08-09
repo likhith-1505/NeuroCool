@@ -69,6 +69,16 @@ class Settings(BaseSettings):
     OPENAI_MODEL: str = "gpt-4o-mini"
     AI_REQUEST_TIMEOUT_SECONDS: float = 30.0
     AI_MAX_RESPONSE_TOKENS: int = 800
+    # --- NeuroCore streaming (see app.neurocore.service.NeuroCoreService.
+    # answer_stream/chat_stream and POST /api/ai/chat/stream) ---
+    # Max time one tool call (see app.neurocore.tools.executor) is allowed
+    # to run during a streamed turn before it's treated as failed.
+    AI_TOOL_TIMEOUT_SECONDS: float = 15.0
+    # Hard ceiling on one streamed chat turn end to end (provider time +
+    # every tool call), independent of how many tool round trips it takes —
+    # bounds worst-case latency even when every individual timeout above is
+    # respected.
+    AI_STREAM_TIMEOUT_SECONDS: float = 60.0
 
     @property
     def SQLALCHEMY_DATABASE_URI(self) -> str:

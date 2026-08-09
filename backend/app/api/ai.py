@@ -8,9 +8,11 @@ app.neurocore. Never exposes internal service objects directly — every
 response is a Pydantic schema.
 """
 
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db, get_neurocore, get_simulation
@@ -18,8 +20,11 @@ from app.models.enums import PendingActionStatus
 from app.neurocore.actions import ActionStateConflict
 from app.neurocore.service import NeuroCoreService
 from app.schemas.ai import ChatRequest, ChatResponse
+from app.schemas.ai_stream import ErrorEvent, encode_sse
 from app.schemas.pending_action import PendingActionRead
 from app.simulation.engine import SimulationService
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
 
@@ -48,6 +53,74 @@ async def chat(
         confidence=result.confidence,
         sources=result.sources,
         pending_action=PendingActionRead.model_validate(result.pending_action) if result.pending_action else None,
+    )
+
+
+@router.post("/chat/stream")
+async def chat_stream(
+    request: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+    simulation: SimulationService = Depends(get_simulation),
+    neurocore: NeuroCoreService = Depends(get_neurocore),
+) -> StreamingResponse:
+    """Server-Sent Events for one AI conversation turn — see
+    app.schemas.ai_stream for the seven typed event shapes and
+    app.neurocore.service.NeuroCoreService.chat_stream for the actual
+    orchestration. This is additive to POST /chat, not a replacement —
+    that endpoint is untouched and keeps working exactly as before.
+
+    Unlike every other route in this module, a request-level failure here
+    (e.g. an unknown conversation_id) is never an HTTP error status: the
+    response has already committed to 200 with an SSE content-type by the
+    time any failure could be detected, so every failure — "not found" or
+    otherwise — is instead the last event sent on the stream (see
+    app.schemas.ai_stream.ErrorEvent).
+
+    Does not use the existing WebSocket infrastructure (see
+    app.websocket.manager) — that remains dedicated to live cluster
+    telemetry and system/AI-action events; this is SSE, scoped to a single
+    request/response, one conversation turn at a time.
+    """
+
+    async def event_source():
+        stream = neurocore.chat_stream(
+            db=db, simulation=simulation, message=request.message,
+            rack_id=request.rack_id, conversation_id=request.conversation_id,
+        )
+        try:
+            async for event in stream:
+                yield encode_sse(event)
+        except LookupError as exc:
+            yield encode_sse(ErrorEvent(code="not_found", message=str(exc)))
+        except Exception:
+            # Last line of defense — NeuroCoreService.chat_stream already
+            # catches everything it can and turns it into a clean
+            # ErrorEvent; this only fires for something that escaped that,
+            # and never leaks the raw exception (see the objective's
+            # error-streaming requirements).
+            logger.exception("Unhandled error while streaming a NeuroCore chat response")
+            yield encode_sse(ErrorEvent(code="internal_error", message="An unexpected error occurred."))
+        finally:
+            # Deterministic cleanup regardless of how we got here (normal
+            # completion, an error above, or the client disconnecting —
+            # which closes *this* generator via GeneratorExit, and this
+            # finally still runs): explicitly closing the inner generator
+            # cascades .aclose() down through chat_stream -> answer_stream
+            # -> the provider's own stream, rather than waiting on garbage
+            # collection to eventually do it. See the objective's
+            # cancellation requirements.
+            await stream.aclose()
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # Disables response buffering on nginx-style reverse proxies,
+            # which would otherwise defeat the whole point of streaming.
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

@@ -21,10 +21,29 @@ comes from the provider's own structured tool-calling output — never from
 regex/keyword-matching the operator's raw text (see app.neurocore.tools
 and app.neurocore.service for where a returned ToolCall is validated and
 dispatched).
+
+Extended again in the streaming phase to carry incremental output:
+`generate_stream()` is the streaming counterpart to `generate()`, yielding
+a series of LLMStreamChunk objects instead of returning one LLMResponse.
+`supports_streaming` lets a provider opt out (e.g. a future adapter with
+no streaming API of its own) — app.neurocore.service.NeuroCoreService.
+answer_stream falls back to a single ordinary generate() call, surfaced as
+one whole-text chunk, when it's False, so "the application must still
+function" even for a non-streaming provider. As with tool calls, each
+adapter is responsible for translating its own vendor's incremental wire
+format (Anthropic's `content_block_delta` SSE events vs. OpenAI's
+`chat.completion.chunk` SSE events) into this one shared shape — in
+particular, `LLMStreamChunk.tool_calls` is only ever populated with
+*complete*, already-parsed ToolCall objects (an adapter accumulates a
+tool call's incrementally-streamed argument fragments internally and only
+emits it here once the whole thing has arrived and parses as JSON), so
+nothing downstream of a provider adapter ever has to deal with partial
+tool-call arguments.
 """
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, TypedDict
 
@@ -94,12 +113,33 @@ class LLMResponse:
     output_tokens: int | None = None
 
 
+@dataclass(frozen=True)
+class LLMStreamChunk:
+    """One increment of a streamed provider response — the streaming
+    counterpart to LLMResponse (see its docstring). `text_delta` is a new
+    fragment of text to append (often empty on a chunk that only carries a
+    completed tool call, or on the final control chunk). `tool_calls` is
+    always a list of *complete* ToolCalls — never partial/incomplete JSON,
+    see the module docstring's streaming-extension note. `finished` marks
+    the terminal chunk; `model`/`input_tokens`/`output_tokens` are only
+    ever populated on that terminal chunk (mirroring how a non-streaming
+    LLMResponse only reports them once, at the end).
+    """
+
+    text_delta: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    finished: bool = False
+    model: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
 class ProviderError(Exception):
-    """Raised by an LLMProvider when generate() fails for any reason — a
-    network error, a non-2xx response, or an unexpected response shape.
-    Adapters must never interpolate the API key or raw response headers
-    into this message (see each adapter's generate() and the objective's
-    observability/security requirements).
+    """Raised by an LLMProvider when generate()/generate_stream() fails for
+    any reason — a network error, a non-2xx response, or an unexpected
+    response shape. Adapters must never interpolate the API key or raw
+    response headers into this message (see each adapter's generate() and
+    the objective's observability/security requirements).
     """
 
 
@@ -111,6 +151,11 @@ class LLMProvider(Protocol):
 
     name: str
     model: str
+    # Whether this adapter implements real streaming. When False,
+    # NeuroCoreService.answer_stream never calls generate_stream() at all
+    # — it calls generate() once and emits the whole result as a single
+    # text_delta chunk instead (see the module docstring).
+    supports_streaming: bool
 
     async def generate(
         self, *, system: str, messages: list[LLMMessage], max_tokens: int, tools: list[ToolSpec] | None = None
@@ -124,5 +169,21 @@ class LLMProvider(Protocol):
         catch it and fall back to a clear, honest "AI reasoning is
         temporarily unavailable" response rather than let it propagate as
         a 500.
+        """
+        ...
+
+    def generate_stream(
+        self, *, system: str, messages: list[LLMMessage], max_tokens: int, tools: list[ToolSpec] | None = None
+    ) -> AsyncIterator[LLMStreamChunk]:
+        """The streaming counterpart to generate() — an async generator
+        (hence a plain `def`, not `async def`: calling it returns the
+        iterator immediately, matching how every real implementation below
+        is written) yielding LLMStreamChunks as they arrive.
+
+        Only ever called when `supports_streaming` is True. Must raise
+        ProviderError (not let a raw network/parsing exception escape) for
+        the same reasons as generate() — see
+        app.neurocore.service.NeuroCoreService.answer_stream, which turns
+        it into a clean `error` stream event rather than a crash.
         """
         ...
