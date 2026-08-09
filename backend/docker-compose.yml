@@ -34,6 +34,17 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    # Forwards every variable in backend/.env into the container as-is
+    # (AI_PROVIDER, ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, the
+    # AI_*_TIMEOUT_SECONDS/AI_MAX_RESPONSE_TOKENS knobs, etc.) — the
+    # `${VAR}` substitutions below are a separate compose-file mechanism
+    # and never actually injected those into the container on their own.
+    # `environment:` entries still take precedence over env_file for the
+    # handful of vars listed in both, which is what supplies sane defaults
+    # even when backend/.env doesn't exist at all.
+    env_file:
+      - path: .env
+        required: false
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}

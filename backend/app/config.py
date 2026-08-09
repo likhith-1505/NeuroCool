@@ -67,19 +67,25 @@ class Settings(BaseSettings):
     SIMULATION_TICK_SECONDS: float = 1.0
 
     # --- NeuroCore AI (see app.neurocore) ---
-    # Which LLMProvider adapter to construct — "anthropic", "openai", or
-    # "mock" (a deterministic, no-network provider useful for local dev
-    # without any key). Provider selection is purely configuration-driven;
-    # nothing outside app.neurocore.providers imports either vendor SDK.
-    # If the selected provider's API key is unset, NeuroCoreService is
-    # constructed with no provider and /api/ai/chat reports a clear
-    # "unavailable" response — the rest of the backend (simulation,
-    # forecasting, optimization, decisions, execution) is unaffected.
+    # Which LLMProvider adapter to construct — "anthropic", "openai",
+    # "gemini", or "mock" (a deterministic, no-network provider useful for
+    # local dev without any key). Provider selection is purely
+    # configuration-driven; nothing outside app.neurocore.providers imports
+    # a vendor SDK. If the selected provider's API key is unset,
+    # NeuroCoreService is constructed with no provider and /api/ai/chat
+    # reports a clear "unavailable" response — the rest of the backend
+    # (simulation, forecasting, optimization, decisions, execution) is
+    # unaffected.
     AI_PROVIDER: str = "anthropic"
     ANTHROPIC_API_KEY: str | None = None
     ANTHROPIC_MODEL: str = "claude-sonnet-5"
     OPENAI_API_KEY: str | None = None
     OPENAI_MODEL: str = "gpt-4o-mini"
+    GEMINI_API_KEY: str | None = None
+    # gemini-flash-lite-latest: the current, non-deprecated, cheapest Gemini
+    # model suitable for interactive development/free-tier use (see
+    # app.neurocore.providers.gemini_provider's module docstring).
+    GEMINI_MODEL: str = "gemini-flash-lite-latest"
     AI_REQUEST_TIMEOUT_SECONDS: float = 30.0
     AI_MAX_RESPONSE_TOKENS: int = 800
     # --- NeuroCore streaming (see app.neurocore.service.NeuroCoreService.

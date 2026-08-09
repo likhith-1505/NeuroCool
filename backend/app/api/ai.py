@@ -16,10 +16,12 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db, get_neurocore, get_simulation
+from app.config import settings
 from app.models.enums import PendingActionStatus
 from app.neurocore.actions import ActionStateConflict
+from app.neurocore.providers.factory import provider_status
 from app.neurocore.service import NeuroCoreService
-from app.schemas.ai import ChatRequest, ChatResponse
+from app.schemas.ai import ChatRequest, ChatResponse, ProviderStatusResponse
 from app.schemas.ai_stream import ErrorEvent, encode_sse
 from app.schemas.pending_action import PendingActionRead
 from app.simulation.engine import SimulationService
@@ -27,6 +29,16 @@ from app.simulation.engine import SimulationService
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
+
+
+@router.get("/providers", response_model=ProviderStatusResponse)
+async def list_providers() -> ProviderStatusResponse:
+    """Which LLMProvider backends are configured/available — never which
+    one is currently active or any secret (see
+    app.neurocore.providers.factory.provider_status). Reads directly from
+    settings; no network call to any vendor.
+    """
+    return ProviderStatusResponse(providers=provider_status(settings))
 
 
 @router.post("/chat", response_model=ChatResponse)

@@ -34,3 +34,18 @@ class ChatResponse(BaseModel):
             "executed yet — POST /api/ai/actions/{id}/confirm or .../cancel to resolve it."
         ),
     )
+
+
+class ProviderStatus(BaseModel):
+    """One LLMProvider's availability — see
+    app.neurocore.providers.factory.provider_status. Never carries an API
+    key or any other secret.
+    """
+
+    name: str
+    configured: bool
+    available: bool
+
+
+class ProviderStatusResponse(BaseModel):
+    providers: list[ProviderStatus]
