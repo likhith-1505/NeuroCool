@@ -13,6 +13,7 @@ from app.schemas.forecast import ClusterForecastRead, ForecastPoint, RackForecas
 from app.schemas.optimization import OptimizationPlanRead
 from app.schemas.rack import RackTelemetry
 from app.schemas.scenario import ScenarioStatus
+from app.schemas.simulation import SimulationStatusRead
 from app.utils.time import utcnow
 
 if TYPE_CHECKING:
@@ -24,6 +25,7 @@ class TelemetrySnapshot(BaseModel):
     cluster: ClusterTelemetry
     racks: list[RackTelemetry]
     scenario: ScenarioStatus
+    simulation: SimulationStatusRead
     decisions: list[DecisionRead]
     forecast: ClusterForecastRead
     rack_forecasts: list[RackForecastRead]
@@ -46,13 +48,17 @@ class TelemetrySnapshot(BaseModel):
         the winner/alternatives split (see OptimizationPlanRead) for
         whichever rack(s) currently have an active plan — "candidate
         actions, best action, expected improvement, confidence" per the
-        optimization objective.
+        optimization objective. `simulation` (see
+        app.schemas.simulation.SimulationStatusRead) is what lets a client
+        connecting while IDLE/PAUSED still see a real, current snapshot —
+        see app.simulation.engine.SimulationService's own module docstring.
         """
         return cls(
             timestamp=timestamp or utcnow(),
             cluster=ClusterTelemetry.model_validate(simulation.cluster_state),
             racks=[RackTelemetry.model_validate(rack) for rack in simulation.rack_states],
             scenario=simulation.scenario_status,
+            simulation=simulation.status,
             decisions=[DecisionRead.model_validate(d) for d in simulation.active_decisions],
             forecast=ClusterForecastRead(
                 predictions=[ForecastPoint.model_validate(p) for p in simulation.cluster_forecast]

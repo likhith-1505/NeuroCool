@@ -1,6 +1,14 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { telemetrySocket, type ConnectionStatus } from "../lib/wsClient";
-import { isAiActionEvent, isTelemetrySnapshot, type AiActionEvent, type EventRead, type TelemetrySnapshot } from "../lib/types";
+import {
+  isAiActionEvent,
+  isSimulationLifecycleEvent,
+  isTelemetrySnapshot,
+  type AiActionEvent,
+  type EventRead,
+  type SimulationStatusRead,
+  type TelemetrySnapshot,
+} from "../lib/types";
 
 const MAX_EVENTS = 60;
 const MAX_AI_ACTION_EVENTS = 20;
@@ -18,6 +26,14 @@ type TelemetryContextValue = {
    * first, capped — surfaced separately since they carry a PendingAction,
    * not a telemetry reading. */
   aiActionEvents: AiActionEvent[];
+  /** The simulation's own lifecycle (idle/running/paused/...) — see
+   * app.simulation.state.SimulationStatus. Kept as its own piece of state
+   * (not just read off `snapshot.simulation`) because IDLE/PAUSED periods
+   * produce no regular snapshot broadcasts at all; this is updated from
+   * both the embedded field on every snapshot AND the dedicated
+   * SIMULATION_STARTED/PAUSED/RESUMED/RESET broadcasts below. Null only
+   * until the very first message (snapshot or lifecycle event) arrives. */
+  simulationStatus: SimulationStatusRead | null;
 };
 
 const TelemetryContext = createContext<TelemetryContextValue | null>(null);
@@ -27,6 +43,7 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
   const [snapshot, setSnapshot] = useState<TelemetrySnapshot | null>(null);
   const [events, setEvents] = useState<EventRead[]>([]);
   const [aiActionEvents, setAiActionEvents] = useState<AiActionEvent[]>([]);
+  const [simulationStatus, setSimulationStatus] = useState<SimulationStatusRead | null>(null);
   const seenEventIds = useRef(new Set<string>());
 
   useEffect(() => {
@@ -42,8 +59,13 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
         setAiActionEvents((current) => [...current, message].slice(-MAX_AI_ACTION_EVENTS));
         return;
       }
+      if (isSimulationLifecycleEvent(message)) {
+        setSimulationStatus(message.simulation);
+        return;
+      }
       if (isTelemetrySnapshot(message)) {
         setSnapshot(message);
+        setSimulationStatus(message.simulation);
         if (message.events && message.events.length > 0) {
           const fresh = message.events.filter((event) => {
             if (seenEventIds.current.has(event.id)) return false;
@@ -69,8 +91,8 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo<TelemetryContextValue>(
-    () => ({ status, snapshot, events, aiActionEvents }),
-    [status, snapshot, events, aiActionEvents],
+    () => ({ status, snapshot, events, aiActionEvents, simulationStatus }),
+    [status, snapshot, events, aiActionEvents, simulationStatus],
   );
 
   return <TelemetryContext.Provider value={value}>{children}</TelemetryContext.Provider>;

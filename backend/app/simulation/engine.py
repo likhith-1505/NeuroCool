@@ -43,6 +43,25 @@ instead of reading forecasts directly (see app.ai.rules._rule_from_
 optimization_plan) — every recommendation the Decision Engine now makes
 from a forecast-driven trigger has already been through candidate
 generation, physics-based simulation, and scoring first.
+
+Lifecycle: `initialize()` (called once from app.main's lifespan) seeds the
+database and builds the baseline in-memory digital twin, but deliberately
+never starts the tick loop — the app must always boot straight into IDLE
+(see app.simulation.state.SimulationStatus), with a human explicitly
+starting the simulation via POST /api/simulation/start. `start()`/
+`pause()`/`resume()` only ever create or cancel the one tick-loop task;
+`reset()` additionally restores the deterministic healthy baseline every
+rack was seeded with and clears every dependent service's *active* state
+(never its durable history — see each service's own `reset()`). Every
+transition is idempotent (see each method's docstring) and broadcasts a
+SIMULATION_* WebSocket event over the exact same connection manager the
+regular per-tick broadcast already uses — this is the "single
+authoritative simulation state" dependent services and the frontend both
+read, rather than each independently tracking whether the app is "live".
+Forecasting/optimization/decisions/execution never need their own IDLE/
+PAUSED awareness at all: they are *only* ever ticked from inside `_tick()`,
+so simply not running the tick loop already means none of them do
+anything while stopped — no separate guard needed in any of them.
 """
 
 from __future__ import annotations
@@ -77,12 +96,13 @@ from app.optimization.planner import SimulationOptimizer
 from app.optimization.service import OptimizationService
 from app.schemas.event import EventRead
 from app.schemas.scenario import ScenarioStatus
+from app.schemas.simulation import SimulationStatusRead
 from app.schemas.telemetry import TelemetrySnapshot
 from app.services.event_service import EventDraft, detect_rack_events, persist_events
 from app.simulation.physics import compute_cluster_state, compute_next_rack_state
 from app.simulation.scenario_manager import SCENARIOS, ScenarioDefinition, ScenarioManager
 from app.simulation.seed import DEFAULT_CLUSTER_LOCATION, DEFAULT_CLUSTER_NAME, RACK_SEEDS
-from app.simulation.state import NO_DRIVERS, ClusterState, RackInternals, RackState, combine_drivers
+from app.simulation.state import NO_DRIVERS, ClusterState, RackInternals, RackState, SimulationStatus, combine_drivers
 from app.utils.time import utcnow
 from app.websocket.manager import manager
 
@@ -143,12 +163,25 @@ class SimulationService:
         self._execution_service = ExecutionService()
         self._forecast_service = ForecastService(engine=TrendForecastEngine())
         self._optimization_service = OptimizationService(engine=SimulationOptimizer(tick_seconds=self.tick_seconds))
+        # --- lifecycle state (see app.simulation.state.SimulationStatus) ---
+        self._initialized = False
+        self._status = SimulationStatus.IDLE
+        self._tick_count = 0
+        self._started_at: datetime | None = None
+        self._paused_at: datetime | None = None
 
     # --- lifecycle -----------------------------------------------------
 
-    async def start(self) -> None:
-        """Seed (if needed) and begin the tick loop. Safe to call once."""
-        if self._task is not None:
+    async def initialize(self) -> None:
+        """Seed the database (idempotent) and build the baseline in-memory
+        digital twin — but never start the tick loop. Called once from
+        app.main's lifespan so REST/WebSocket endpoints have real state to
+        serve immediately (GET /api/cluster, /api/racks, /ws/telemetry —
+        all still work while IDLE), without the "the datacenter immediately
+        starts changing telemetry" problem this lifecycle exists to fix.
+        Safe to call more than once; only does real work the first time.
+        """
+        if self._initialized:
             return
 
         async with AsyncSessionLocal() as db:
@@ -166,17 +199,130 @@ class SimulationService:
             prediction_confidence=90.0,
         )
         for rack in racks:
-            self._racks[rack.id] = self._initial_rack_state(rack)
+            self._racks[rack.id] = self._initial_rack_state(rack.id, rack.name)
             self._internals[rack.id] = RackInternals(
                 gpu_baseline=self._racks[rack.id].gpu_utilization,
                 jobs_baseline=float(self._racks[rack.id].running_jobs),
             )
 
+        self._initialized = True
+        logger.info(
+            "Simulation initialized: %d rack(s), tick=%.1fs, status=%s",
+            len(self._racks), self.tick_seconds, self._status.value,
+        )
+
+    async def start(self) -> SimulationStatusRead:
+        """Begin the tick loop. Idempotent: a no-op returning the current
+        state if already RUNNING; delegates to resume() if PAUSED (there is
+        no meaningful difference between "start" and "resume" once telemetry
+        already exists, and the frontend never shows both buttons at once —
+        see the objective's PAUSED-state control).
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        if self._status == SimulationStatus.RUNNING:
+            return self.status
+        if self._status == SimulationStatus.PAUSED:
+            return await self.resume()
+
+        self._started_at = utcnow()
+        self._paused_at = None
+        self._tick_count = 0
+        self._status = SimulationStatus.RUNNING
         self._task = asyncio.create_task(self._run(), name="simulation-tick-loop")
-        logger.info("Simulation started: %d rack(s), tick=%.1fs", len(self._racks), self.tick_seconds)
+        logger.info("Simulation running: %d rack(s), tick=%.1fs", len(self._racks), self.tick_seconds)
+        await self._broadcast_simulation_event("SIMULATION_STARTED")
+        return self.status
+
+    async def pause(self) -> SimulationStatusRead:
+        """Stop the tick loop without losing any state. Idempotent: a
+        no-op returning the current state unless currently RUNNING.
+        """
+        if self._status != SimulationStatus.RUNNING:
+            return self.status
+        await self._cancel_task()
+        self._status = SimulationStatus.PAUSED
+        self._paused_at = utcnow()
+        logger.info("Simulation paused at tick %d", self._tick_count)
+        await self._broadcast_simulation_event("SIMULATION_PAUSED")
+        return self.status
+
+    async def resume(self) -> SimulationStatusRead:
+        """Continue ticking from the exact current state — never resets
+        telemetry. Idempotent: a no-op returning the current state unless
+        currently PAUSED.
+        """
+        if self._status != SimulationStatus.PAUSED:
+            return self.status
+        self._paused_at = None
+        self._status = SimulationStatus.RUNNING
+        self._task = asyncio.create_task(self._run(), name="simulation-tick-loop")
+        logger.info("Simulation resumed at tick %d", self._tick_count)
+        await self._broadcast_simulation_event("SIMULATION_RESUMED")
+        return self.status
+
+    async def reset(self) -> SimulationStatusRead:
+        """Stop the tick loop, clear the active scenario and every
+        dependent service's transient/active state, and restore the exact
+        deterministic healthy baseline every rack was seeded with — then
+        return to IDLE. Safe to call repeatedly (each call independently
+        restores the same baseline). Durable history (Cluster/Rack
+        identity, Events, Decisions, Executions, OptimizationPlans in the
+        database) is never touched or deleted — only the live, in-memory
+        state every dependent service reacts to.
+        """
+        await self._cancel_task()
+
+        # Reuses the *existing* scenario-reset path (persists + broadcasts
+        # its own "Scenario Reset" event) rather than duplicating it.
+        await self.reset_scenario()
+
+        for rack_id, previous in self._racks.items():
+            fresh = self._initial_rack_state(rack_id, previous.name)
+            self._racks[rack_id] = fresh
+            self._internals[rack_id] = RackInternals(
+                gpu_baseline=fresh.gpu_utilization, jobs_baseline=float(fresh.running_jobs)
+            )
+
+        if self._cluster is not None:
+            self._cluster = ClusterState(
+                id=self._cluster.id,
+                name=self._cluster.name,
+                overall_health=_INITIAL_HEALTH_SCORE,
+                average_temperature=_INITIAL_TEMPERATURE_C,
+                total_power=_INITIAL_POWER_KW * len(self._racks),
+                cooling_efficiency=_INITIAL_COOLING_EFFICIENCY,
+                energy_savings=15.0,
+                prediction_confidence=90.0,
+            )
+
+        self._forecast_service.reset()
+        self._optimization_service.reset()
+        self._decision_service.reset()
+        self._execution_service.reset()
+
+        self._last_tick_at = None
+        self._tick_count = 0
+        self._started_at = None
+        self._paused_at = None
+        self._status = SimulationStatus.IDLE
+        logger.info("Simulation reset to baseline: %d rack(s)", len(self._racks))
+        await self._broadcast_simulation_event("SIMULATION_RESET")
+        return self.status
 
     async def stop(self) -> None:
-        """Cancel the tick loop. Safe to call even if never started."""
+        """Cleanly cancel the tick loop, if running — called from
+        app.main's lifespan shutdown. Safe to call even if the simulation
+        was never started, or is already paused/idle. Deliberately doesn't
+        change `status`/broadcast anything: the process is exiting, there's
+        no client left to notify and nothing to resume into next time (see
+        the module docstring — a fresh process always boots into IDLE).
+        """
+        await self._cancel_task()
+        logger.info("Simulation shut down (status was %s)", self._status.value)
+
+    async def _cancel_task(self) -> None:
         if self._task is None:
             return
         self._task.cancel()
@@ -185,14 +331,19 @@ class SimulationService:
         except asyncio.CancelledError:
             pass
         self._task = None
-        logger.info("Simulation stopped")
 
     # --- read access for the REST API and WebSocket endpoint -----------
 
     @property
+    def status(self) -> SimulationStatusRead:
+        return SimulationStatusRead(
+            status=self._status, tick=self._tick_count, started_at=self._started_at, paused_at=self._paused_at
+        )
+
+    @property
     def cluster_state(self) -> ClusterState:
         if self._cluster is None:
-            raise RuntimeError("Simulation has not started yet")
+            raise RuntimeError("Simulation has not been initialized yet")
         return self._cluster
 
     @property
@@ -211,6 +362,7 @@ class SimulationService:
             transition_state=manager_.transition_state,
             target_rack_id=manager_.target_rack_id,
             activated_at=manager_.activated_at,
+            can_replay=manager_.can_replay,
         )
 
     @staticmethod
@@ -220,21 +372,38 @@ class SimulationService:
     # --- scenario control (called from the REST API) -----------------------
 
     async def activate_scenario(self, key: str) -> ScenarioStatus:
-        """Raises ValueError (-> 400 at the API layer) for an unknown key."""
+        """Raises ValueError (-> 400 at the API layer) for an unknown key,
+        or if the simulation isn't RUNNING — a scenario must never
+        silently start the simulation loop for the user (see the
+        objective); the operator has to press Start first.
+        """
+        self._require_running_for_scenario()
         definition = self._scenario_manager.activate(key, self.rack_states)
         await self._emit_scenario_event(definition, kind="activate")
         return self.scenario_status
 
     async def reset_scenario(self) -> ScenarioStatus:
+        """Always allowed, regardless of simulation status — resetting the
+        active scenario back to normal is itself never destructive, and is
+        also reused by SimulationService.reset() while the tick loop is
+        already stopped.
+        """
         definition = self._scenario_manager.reset(self.rack_states)
         await self._emit_scenario_event(definition, kind="reset")
         return self.scenario_status
 
     async def replay_scenario(self) -> ScenarioStatus:
-        """Raises ValueError (-> 400 at the API layer) if nothing has run yet."""
+        """Raises ValueError (-> 400 at the API layer) if nothing has run
+        yet, or if the simulation isn't RUNNING (see activate_scenario).
+        """
+        self._require_running_for_scenario()
         definition = self._scenario_manager.replay(self.rack_states)
         await self._emit_scenario_event(definition, kind="activate")
         return self.scenario_status
+
+    def _require_running_for_scenario(self) -> None:
+        if self._status != SimulationStatus.RUNNING:
+            raise ValueError("Start the simulation before running a scenario.")
 
     # --- decisions (called from the REST API) -------------------------------
 
@@ -347,6 +516,7 @@ class SimulationService:
 
     async def _tick(self) -> None:
         assert self._cluster is not None
+        self._tick_count += 1
         now = utcnow()
 
         # A duration-bound scenario (e.g. power_surge) can complete on its
@@ -454,6 +624,24 @@ class SimulationService:
         if events_payload:
             payload["events"] = events_payload
         await manager.broadcast(payload)
+
+    async def _broadcast_simulation_event(self, event_type: str) -> None:
+        """SIMULATION_STARTED/PAUSED/RESUMED/RESET — reuses the existing
+        WebSocket connection manager (no second WebSocket system), the
+        exact same "type"-discriminated pattern app.neurocore.actions.
+        PendingActionService._broadcast already uses for AI_ACTION_*
+        events. Needed as its own broadcast (distinct from the regular
+        per-tick one above) specifically *because* IDLE/PAUSED produce no
+        tick broadcasts at all — this is the only way a client (including
+        one connected from a different tab) learns the lifecycle changed.
+        """
+        if manager.connection_count == 0:
+            return
+        payload = {"type": event_type, "simulation": self.status.model_dump(mode="json")}
+        try:
+            await manager.broadcast(payload)
+        except Exception:  # pragma: no cover - defensive, mirrors the tick loop's own broadcast guard
+            logger.exception("Failed to broadcast simulation event %s", event_type)
 
     # --- scenario events -----------------------------------------------------
 
@@ -566,11 +754,15 @@ class SimulationService:
         return {key: row.id for key, row in existing.items()}
 
     @staticmethod
-    def _initial_rack_state(rack: Rack) -> RackState:
-        seed = next((s for s in RACK_SEEDS if s["name"] == rack.name), RACK_SEEDS[0])
+    def _initial_rack_state(rack_id: uuid.UUID, name: str) -> RackState:
+        """Takes just the id/name (not a full ORM Rack row) so
+        SimulationService.reset() can rebuild the exact same baseline for
+        an already-in-memory rack without another database round trip.
+        """
+        seed = next((s for s in RACK_SEEDS if s["name"] == name), RACK_SEEDS[0])
         return RackState(
-            id=rack.id,
-            name=rack.name,
+            id=rack_id,
+            name=name,
             temperature=_INITIAL_TEMPERATURE_C,
             gpu_utilization=float(seed["baseline_gpu"]),
             cpu_utilization=_INITIAL_CPU_UTILIZATION,

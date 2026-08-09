@@ -163,6 +163,16 @@ class ExecutionManager:
     def active_count(self) -> int:
         return len(self._active)
 
+    def reset(self) -> None:
+        """Drops every in-progress execution's ongoing physics influence —
+        called from app.simulation.engine.SimulationService.reset. The
+        durable Execution rows/history (owned by ExecutionService, not
+        here) are untouched; this only clears what's still actively
+        ramping a rack's drivers, so a restored baseline isn't immediately
+        pulled off it again by a remediation left over from before reset.
+        """
+        self._active = {}
+
     @staticmethod
     def _fraction_for(elapsed: float) -> float:
         """Linear ramp in over RAMP_SECONDS, full effect through the hold,

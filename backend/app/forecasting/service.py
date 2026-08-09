@@ -99,6 +99,21 @@ class ForecastService:
     def rack_forecast(self, rack_id: uuid.UUID) -> list[RackPrediction]:
         return self._rack_forecasts.get(rack_id, [])
 
+    def reset(self) -> None:
+        """Drops rolling history and every cached prediction — called from
+        app.simulation.engine.SimulationService.reset so a fresh simulation
+        run doesn't extrapolate a trend from telemetry that no longer
+        exists once the baseline has been restored. No database rows exist
+        here to begin with (forecasts are never persisted, see the module
+        docstring), so this is purely in-memory and instant.
+        """
+        self._history = TelemetryHistory()
+        self._rack_forecasts = {}
+        self._previous_rack_forecasts = {}
+        self._cluster_forecast = []
+        self._previous_cluster_risk = None
+        self._ticks_seen = 0
+
     # --- per-tick ---------------------------------------------------------
 
     async def tick(

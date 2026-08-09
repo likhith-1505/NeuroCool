@@ -27,7 +27,12 @@ async def lifespan(app: FastAPI):
     # being trivially swappable in tests.
     simulation = SimulationService()
     app.state.simulation = simulation
-    await simulation.start()
+    # Seeds the database and builds the baseline digital twin, but
+    # deliberately does NOT start the tick loop — the app must always boot
+    # straight into IDLE; a human explicitly starts the simulation via
+    # POST /api/simulation/start (see app.simulation.engine.SimulationService
+    # and app.api.simulation).
+    await simulation.initialize()
 
     # NeuroCore starts regardless of whether an LLM provider is
     # configured — build_provider_from_settings returns None rather than

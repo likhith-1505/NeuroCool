@@ -35,6 +35,11 @@ class ScenarioStatus(BaseModel):
     transition_state: TransitionState
     target_rack_id: uuid.UUID | None
     activated_at: datetime
+    # Lets a client disable/hide its Replay control instead of triggering a
+    # guaranteed 400 — see ScenarioManager.can_replay. Defaults False so
+    # the handful of hand-built fakes in tests/ (which predate this field)
+    # don't all need updating for an axis they don't exercise.
+    can_replay: bool = False
 
 
 class ScenarioActivateRequest(BaseModel):

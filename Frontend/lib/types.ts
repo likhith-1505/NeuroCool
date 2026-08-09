@@ -34,6 +34,20 @@ export type PendingActionStatus =
 // RackTelemetry.prediction_state.
 export type PredictionState = "stable" | "watch" | "at_risk";
 
+// --- simulation lifecycle (app/simulation/state.py, app/schemas/simulation.py) ---
+// Whether the tick loop itself is running — distinct from ScenarioStatus
+// below, which is *what* a running simulation is doing. The app always
+// boots into "idle"; a human explicitly starts it (see GET/POST
+// /api/simulation*).
+export type SimulationStatusValue = "idle" | "running" | "paused" | "completed" | "error";
+
+export type SimulationStatusRead = {
+  status: SimulationStatusValue;
+  tick: number;
+  started_at: string | null;
+  paused_at: string | null;
+};
+
 // --- cluster / rack telemetry (app/schemas/cluster.py, rack.py) -----------
 
 export type ClusterTelemetry = {
@@ -94,6 +108,10 @@ export type ScenarioStatus = {
   transition_state: "transitioning" | "steady";
   target_rack_id: string | null;
   activated_at: string;
+  // Whether POST /api/scenario/replay would currently succeed — lets the
+  // UI disable/hide Replay instead of triggering a guaranteed 400 on a
+  // fresh cluster (see backend ScenarioManager.can_replay).
+  can_replay: boolean;
 };
 
 // --- forecast (app/schemas/forecast.py) -------------------------------------
@@ -241,6 +259,7 @@ export type TelemetrySnapshot = {
   cluster: ClusterTelemetry;
   racks: RackTelemetry[];
   scenario: ScenarioStatus;
+  simulation: SimulationStatusRead;
   decisions: DecisionRead[];
   forecast: ClusterForecastRead;
   rack_forecasts: RackForecastRead[];
@@ -267,14 +286,34 @@ export type AiActionEvent = {
   action: PendingActionRead;
 };
 
-export type WsMessage = TelemetrySnapshot | AiActionEvent;
+// Simulation lifecycle broadcasts (SimulationService._broadcast_simulation_
+// event) — fired on start/pause/resume/reset independent of the regular
+// per-tick broadcast, since IDLE/PAUSED periods produce no ticks at all.
+// Distinguished from a TelemetrySnapshot the same way AiActionEvent is: by
+// the `type` discriminator a regular tick payload never has.
+export type SimulationLifecycleEventType =
+  | "SIMULATION_STARTED"
+  | "SIMULATION_PAUSED"
+  | "SIMULATION_RESUMED"
+  | "SIMULATION_RESET";
+
+export type SimulationLifecycleEvent = {
+  type: SimulationLifecycleEventType;
+  simulation: SimulationStatusRead;
+};
+
+export type WsMessage = TelemetrySnapshot | AiActionEvent | SimulationLifecycleEvent;
 
 export function isAiActionEvent(message: WsMessage): message is AiActionEvent {
   return typeof (message as AiActionEvent).type === "string" && (message as AiActionEvent).type.startsWith("AI_ACTION_");
 }
 
+export function isSimulationLifecycleEvent(message: WsMessage): message is SimulationLifecycleEvent {
+  return typeof (message as SimulationLifecycleEvent).type === "string" && (message as SimulationLifecycleEvent).type.startsWith("SIMULATION_");
+}
+
 export function isTelemetrySnapshot(message: WsMessage): message is TelemetrySnapshot {
-  return !isAiActionEvent(message) && "cluster" in message && "racks" in message;
+  return !isAiActionEvent(message) && !isSimulationLifecycleEvent(message) && "cluster" in message && "racks" in message;
 }
 
 // --- AI streaming events (app/schemas/ai_stream.py) -------------------------

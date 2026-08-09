@@ -23,6 +23,7 @@ import type {
   RackTelemetry,
   ScenarioDefinitionRead,
   ScenarioStatus,
+  SimulationStatusRead,
 } from "./types";
 
 export class ApiError extends Error {
@@ -93,6 +94,16 @@ export const apiClient = {
 
   // --- events ----------------------------------------------------------
   listEvents: (limit = 50) => request<EventRead[]>(`/api/events?limit=${limit}`),
+
+  // --- simulation lifecycle (app/api/simulation.py) -----------------------
+  // Distinct from the scenario endpoints below: this controls *whether*
+  // the tick loop is running at all, not *what* a running simulation is
+  // doing. See app.simulation.state.SimulationStatus.
+  getSimulationStatus: () => request<SimulationStatusRead>("/api/simulation"),
+  startSimulation: () => request<SimulationStatusRead>("/api/simulation/start", { method: "POST" }),
+  pauseSimulation: () => request<SimulationStatusRead>("/api/simulation/pause", { method: "POST" }),
+  resumeSimulation: () => request<SimulationStatusRead>("/api/simulation/resume", { method: "POST" }),
+  resetSimulation: () => request<SimulationStatusRead>("/api/simulation/reset", { method: "POST" }),
 
   // --- scenarios ---------------------------------------------------------
   listScenarios: () => request<ScenarioDefinitionRead[]>("/api/scenarios"),

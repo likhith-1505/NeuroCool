@@ -77,6 +77,16 @@ class OptimizationService:
     def get(self, plan_id: uuid.UUID) -> OptimizationPlanRow | None:
         return self._cache.get(plan_id)
 
+    def reset(self) -> None:
+        """Clears which plans currently count as *active* — called from
+        app.simulation.engine.SimulationService.reset. Historical plans
+        (`all_plans`/`get`/the underlying database rows) are untouched;
+        only the active set that TelemetrySnapshot exposes is emptied, so
+        a resumed simulation starts fresh rather than reporting a plan for
+        a trigger that no longer exists post-reset.
+        """
+        self._active = {}
+
     # --- per-tick ---------------------------------------------------------
 
     async def tick(

@@ -93,6 +93,13 @@ class ExecutionService:
     def get(self, execution_id: uuid.UUID) -> Execution | None:
         return self._cache.get(execution_id)
 
+    def reset(self) -> None:
+        """See ExecutionManager.reset — clears in-progress executions'
+        ongoing effect. Historical Execution rows (`all_executions`/`get`)
+        are untouched.
+        """
+        self._manager.reset()
+
     # --- starting an execution (called from execute_decision) --------------
 
     async def start(

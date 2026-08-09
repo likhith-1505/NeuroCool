@@ -2,6 +2,7 @@ import { motion } from "framer-motion";
 import { NavLink } from "react-router-dom";
 import type { ConnectionStatus } from "../lib/wsClient";
 import ConnectionBadge from "./ConnectionBadge";
+import SimulationControl from "./SimulationControl";
 
 type WorkspaceNavProps = {
   clusterStatus: string;
@@ -66,6 +67,7 @@ export default function WorkspaceNav({ clusterStatus, theme, connectionStatus, o
         </div>
 
         <div className="flex items-center justify-end gap-1.5">
+          <SimulationControl />
           <ConnectionBadge status={connectionStatus} />
 
           <div

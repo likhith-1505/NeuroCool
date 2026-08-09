@@ -74,6 +74,16 @@ class DecisionService:
     def get(self, decision_id: uuid.UUID) -> Decision | None:
         return self._cache.get(decision_id)
 
+    def reset(self) -> None:
+        """Clears which decisions currently count as *active* — called
+        from app.simulation.engine.SimulationService.reset. Historical
+        decisions (`all_decisions`/`get`/the underlying database rows) are
+        untouched; only the active set that TelemetrySnapshot exposes is
+        emptied, so a resumed simulation starts fresh rather than
+        reporting a decision for a rule that no longer applies post-reset.
+        """
+        self._active = {}
+
     # --- evaluation: called once per simulation tick ------------------------
 
     async def evaluate(

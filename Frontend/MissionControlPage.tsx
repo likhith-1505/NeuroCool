@@ -25,8 +25,41 @@ function toClusterRacks(racks: ScenarioRack[]): ClusterRack[] {
   }));
 }
 
+// Backend-state-accurate labels — never a generic "LIVE"/"Connected" that
+// doesn't distinguish "WebSocket connected" from "simulation ticking" (see
+// the objective: connecting to /ws/telemetry must never read as "running").
+const STATUS_COPY: Record<string, { label: string; detail: string; dot: string }> = {
+  idle: {
+    label: "SIMULATION READY",
+    detail: "The datacenter is stable. Press Start Simulation to bring telemetry live.",
+    dot: "bg-white/40",
+  },
+  paused: {
+    label: "SIMULATION PAUSED",
+    detail: "Telemetry is frozen at its current state. Press Resume to continue.",
+    dot: "bg-amber-300/80",
+  },
+  running: {
+    label: "SIMULATION LIVE",
+    detail: "Telemetry is ticking from the live backend digital twin.",
+    dot: "bg-emerald-300/90",
+  },
+  completed: {
+    label: "SIMULATION READY",
+    detail: "The datacenter is stable. Press Start Simulation to bring telemetry live.",
+    dot: "bg-white/40",
+  },
+  error: {
+    label: "SIMULATION READY",
+    detail: "The datacenter is stable. Press Start Simulation to bring telemetry live.",
+    dot: "bg-white/40",
+  },
+};
+
 export default function MissionControlPage() {
-  const { racks: engineRacks, scenario, ai, metrics, timelineEvents, pulseKey, isLoading, scenarioError } = useScenarioEngine();
+  const {
+    racks: engineRacks, scenario, ai, metrics, timelineEvents, pulseKey, isLoading, scenarioError, simulationStatus,
+  } = useScenarioEngine();
   const [focusedRackId, setFocusedRackId] = useState<string | null>(null);
   const executionFlow = useExecuteRecommendation();
 
@@ -67,6 +100,21 @@ export default function MissionControlPage() {
           {scenarioError ? (
             <div className="rounded-xl border border-rose-300/25 bg-rose-300/[0.08] px-3 py-2 text-[0.68rem] text-rose-100/85">
               {scenarioError}
+            </div>
+          ) : null}
+
+          {simulationStatus ? (
+            <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2 text-[0.62rem] uppercase tracking-[0.14em] text-white/56">
+              <span className="relative flex h-1.5 w-1.5">
+                {simulationStatus.status === "running" ? (
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-300/60" />
+                ) : null}
+                <span className={`relative inline-flex h-1.5 w-1.5 rounded-full ${(STATUS_COPY[simulationStatus.status] ?? STATUS_COPY.idle).dot}`} />
+              </span>
+              {(STATUS_COPY[simulationStatus.status] ?? STATUS_COPY.idle).label}
+              <span className="normal-case tracking-normal text-white/38">
+                — {(STATUS_COPY[simulationStatus.status] ?? STATUS_COPY.idle).detail}
+              </span>
             </div>
           ) : null}
 

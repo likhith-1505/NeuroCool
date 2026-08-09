@@ -10,10 +10,30 @@ Event rows (see app.services.event_service).
 
 from __future__ import annotations
 
+import enum
 import uuid
 from dataclasses import dataclass
 
 from app.models.enums import RackStatus
+
+
+class SimulationStatus(str, enum.Enum):
+    """The simulation's own lifecycle — whether the tick loop is running at
+    all. Deliberately separate from ScenarioManager's active scenario
+    (which only matters once RUNNING) and never persisted to the database:
+    this whole module is in-memory-only state (see the module docstring),
+    and this status resets to IDLE every time the process restarts, which
+    is exactly the desired behavior (see
+    app.simulation.engine.SimulationService's module docstring and
+    app.main's lifespan — the app must always boot into IDLE, never resume
+    a previous run).
+    """
+
+    IDLE = "idle"
+    RUNNING = "running"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    ERROR = "error"
 
 
 @dataclass

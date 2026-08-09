@@ -168,6 +168,15 @@ class ScenarioManager:
         return self._active.target_rack_id
 
     @property
+    def can_replay(self) -> bool:
+        """Whether replay() would currently succeed — lets callers (the
+        REST layer, the frontend) disable/hide a Replay control instead of
+        letting a user trigger a guaranteed ValueError('No previous
+        scenario to replay yet.') on a fresh cluster. See replay() below.
+        """
+        return self._last_non_normal_key is not None
+
+    @property
     def activated_at(self) -> datetime:
         return self._active.activated_at
 

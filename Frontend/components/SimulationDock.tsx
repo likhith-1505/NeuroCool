@@ -44,7 +44,7 @@ function liftFor(index: number, hoverIndex: number | null): number {
 }
 
 export default function SimulationDock() {
-  const { scenario, isReplaying, pulseKey, selectScenario, triggerReplay, resetScenario } = useScenarioEngine();
+  const { scenario, isReplaying, canReplay, pulseKey, selectScenario, triggerReplay, resetScenario } = useScenarioEngine();
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
   const [flashKey, setFlashKey] = useState<string | null>(null);
   const lastTriggered = useRef<string | null>(null);
@@ -56,8 +56,18 @@ export default function SimulationDock() {
     return () => window.clearTimeout(timeout);
   }, [pulseKey]);
 
+  // Replay has nothing to replay until a non-normal scenario has run at
+  // least once (see ScenarioEngine's canReplay / backend ScenarioManager.
+  // can_replay) — disabled here rather than left clickable into a
+  // guaranteed 400, per the objective's "no failed request during normal
+  // startup" requirement.
+  function isDisabled(control: Control): boolean {
+    if (control.kind === "replay") return !canReplay;
+    return isReplaying;
+  }
+
   function handleClick(control: Control) {
-    if (isReplaying) return;
+    if (isDisabled(control)) return;
     lastTriggered.current = controlKey(control);
     if (control.kind === "scenario") selectScenario(control.id);
     else if (control.kind === "replay") triggerReplay();
@@ -81,6 +91,7 @@ export default function SimulationDock() {
           const isGlowing = flashKey === key;
           const isHovered = hoverIndex === index;
           const label = controlLabel(control);
+          const disabled = isDisabled(control);
 
           return (
             <motion.button
@@ -89,11 +100,12 @@ export default function SimulationDock() {
               onClick={() => handleClick(control)}
               onMouseEnter={() => setHoverIndex(index)}
               onFocus={() => setHoverIndex(index)}
+              disabled={disabled}
               animate={{ scale: scaleFor(index, hoverIndex), y: liftFor(index, hoverIndex) }}
               transition={{ type: "spring", stiffness: 380, damping: 22, mass: 0.6 }}
-              className={`group relative flex min-w-[5.4rem] flex-col items-center gap-1.5 rounded-xl px-2.5 py-2.5 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.08)] transition-colors duration-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[rgba(var(--accent-rgb),0.7)] ${
+              className={`group relative flex min-w-[5.4rem] flex-col items-center gap-1.5 rounded-xl px-2.5 py-2.5 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.08)] transition-colors duration-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[rgba(var(--accent-rgb),0.7)] disabled:pointer-events-none ${
                 isActive ? "bg-[rgba(var(--accent-rgb),0.16)] text-white" : "bg-white/[0.045] text-white/75 hover:bg-[rgba(var(--accent-rgb),0.18)] hover:text-white"
-              } ${isReplaying && control.kind !== "replay" ? "opacity-40" : ""}`}
+              } ${disabled ? "opacity-40" : ""}`}
               style={{ transformOrigin: "bottom center" }}
             >
               <span
@@ -130,7 +142,9 @@ export default function SimulationDock() {
                     className="pointer-events-none absolute -top-12 left-1/2 z-30 w-max max-w-[11rem] -translate-x-1/2 rounded-lg border border-white/12 bg-[#0d0920]/95 px-2.5 py-1.5 text-center shadow-[0_10px_28px_rgba(0,0,0,0.5)] backdrop-blur-xl"
                   >
                     <p className="text-[0.56rem] font-medium uppercase tracking-[0.1em] text-white/88">{label}</p>
-                    <p className="mt-0.5 text-[0.52rem] leading-snug text-white/56">{control.hint}</p>
+                    <p className="mt-0.5 text-[0.52rem] leading-snug text-white/56">
+                      {control.kind === "replay" && !canReplay ? "No previous scenario to replay yet." : control.hint}
+                    </p>
                     <span className="absolute left-1/2 top-full h-2 w-2 -translate-x-1/2 -translate-y-1 rotate-45 border-b border-r border-white/12 bg-[#0d0920]/95" />
                   </motion.span>
                 ) : null}

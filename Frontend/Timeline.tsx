@@ -91,7 +91,26 @@ export default function Timeline({ events, activeEventId, className }: TimelineP
                 <h3 className="mt-1 text-[0.98rem] font-medium leading-snug text-white">{activeEvent.title}</h3>
                 <p className="mt-0.5 text-[0.74rem] leading-snug text-white/68">{activeEvent.description ?? activeEvent.title}</p>
               </motion.div>
-            ) : null}
+            ) : (
+              // Honest empty state — no events have actually happened yet
+              // (see ScenarioEngine's timelineEvents), rather than a
+              // fabricated entry that would make "0 events" look like "1
+              // event logged" above.
+              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.3 }}>
+                <div className="flex items-center gap-2">
+                  <span className="relative h-2 w-2 rounded-full bg-white/25" />
+                  {/* Deliberately not "Awaiting Telemetry" — a live, valid
+                      snapshot may already be showing above; this only means
+                      no *events* have been recorded, a narrower and
+                      unambiguous claim. */}
+                  <p className="text-[0.52rem] uppercase tracking-[0.24em] text-white/40">No Events Yet</p>
+                </div>
+                <h3 className="mt-1 text-[0.98rem] font-medium leading-snug text-white/70">No events recorded yet</h3>
+                <p className="mt-0.5 text-[0.74rem] leading-snug text-white/50">
+                  Start the simulation to begin recording live events on this timeline.
+                </p>
+              </motion.div>
+            )}
           </AnimatePresence>
         </div>
 

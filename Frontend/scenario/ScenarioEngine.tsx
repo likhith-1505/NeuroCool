@@ -18,7 +18,7 @@
  */
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { apiClient } from "../lib/apiClient";
-import type { ClusterTelemetry, DecisionRead, EventRead, ForecastPoint, RackTelemetry } from "../lib/types";
+import type { ClusterTelemetry, DecisionRead, EventRead, ForecastPoint, RackTelemetry, SimulationStatusRead } from "../lib/types";
 import { useSettings } from "../settings/SettingsContext";
 import { useTelemetry } from "../state/TelemetryContext";
 
@@ -252,12 +252,6 @@ function toAi(
   };
 }
 
-let eventSeq = 0;
-function localEvent(title: string, description: string): TimelineEventItem {
-  eventSeq += 1;
-  return { id: `local-${eventSeq}`, title, timestamp: "Now", description };
-}
-
 function toTimelineEvent(event: EventRead): TimelineEventItem {
   const time = new Date(event.occurred_at);
   const timestamp = Number.isNaN(time.getTime())
@@ -281,26 +275,44 @@ type ScenarioEngineValue = {
   clusterForecast: ForecastPoint[];
   isLoading: boolean;
   isReplaying: boolean;
+  /** Whether POST /api/scenario/replay would currently succeed — a fresh
+   * cluster (nothing but "normal" has ever run) has no replay history
+   * yet. Drives disabling the Replay control instead of letting a user
+   * trigger a guaranteed 400 (see backend ScenarioManager.can_replay). */
+  canReplay: boolean;
   pulseKey: number;
   resetToken: number;
   scenarioError: string | null;
   selectScenario: (id: ScenarioId) => void;
   triggerReplay: () => void;
   resetScenario: () => void;
+  /** Whether the tick loop itself is running — see
+   * app.simulation.state.SimulationStatus. Null only until the first
+   * WebSocket message arrives. Distinct from `scenario`/`resetScenario`
+   * above, which are about *what* a running simulation is doing, not
+   * *whether* it's running at all. */
+  simulationStatus: SimulationStatusRead | null;
+  isSimulationBusy: boolean;
+  startSimulation: () => void;
+  pauseSimulation: () => void;
+  resumeSimulation: () => void;
+  resetSimulation: () => void;
 };
 
 const ScenarioEngineContext = createContext<ScenarioEngineValue | null>(null);
 
 export function ScenarioEngineProvider({ children }: { children: ReactNode }) {
-  const { snapshot, events } = useTelemetry();
+  const { snapshot, events, simulationStatus } = useTelemetry();
   const { simulationMode, predictionIntervalMs } = useSettings();
   const [pulseKey, setPulseKey] = useState(0);
   const [resetToken, setResetToken] = useState(0);
   const [pendingRequest, setPendingRequest] = useState(false);
+  const [simulationBusy, setSimulationBusy] = useState(false);
   const [scenarioError, setScenarioError] = useState<string | null>(null);
   const requestGuard = useRef(0);
 
   const scenario = (snapshot?.scenario.key as ScenarioId | undefined) ?? "normal";
+  const canReplay = snapshot?.scenario.can_replay ?? false;
 
   const racks = useMemo<ScenarioRack[]>(() => {
     if (!snapshot) return [];
@@ -316,12 +328,12 @@ export function ScenarioEngineProvider({ children }: { children: ReactNode }) {
     [snapshot, scenario],
   );
 
-  const timelineEvents = useMemo<TimelineEventItem[]>(() => {
-    if (events.length === 0) {
-      return [localEvent("Awaiting Telemetry", "Connecting to the NeuroCool backend's live event stream.")];
-    }
-    return events.slice(-12).map(toTimelineEvent);
-  }, [events]);
+  // Real backend Event rows only (see TelemetryContext) — an empty array
+  // while IDLE/freshly connected is the honest state, not a fabricated
+  // placeholder entry. Timeline.tsx renders its own empty state rather
+  // than this engine inventing a fake "event" just to have something to
+  // show (that previously made "0 events" render as "1 event logged").
+  const timelineEvents = useMemo<TimelineEventItem[]>(() => events.slice(-12).map(toTimelineEvent), [events]);
 
   // A pulse (used by MissionControlPage/DigitalTwinWorkspace to refocus the
   // most-affected rack) whenever the active scenario key actually changes.
@@ -369,6 +381,16 @@ export function ScenarioEngineProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const triggerReplay = useCallback(() => {
+    // Defense in depth: the Replay control is already disabled whenever
+    // !canReplay (see SimulationDock/App.tsx), so this only fires for a
+    // caller that ignored that — a controlled, request-free message
+    // instead of a guaranteed 400 round-trip. Never auto-invoked on
+    // mount; this is only ever reached from an explicit user click (see
+    // callers).
+    if (!canReplay) {
+      setScenarioError("No previous scenario to replay yet.");
+      return;
+    }
     const token = ++requestGuard.current;
     setScenarioError(null);
     setPendingRequest(true);
@@ -382,13 +404,18 @@ export function ScenarioEngineProvider({ children }: { children: ReactNode }) {
         if (requestGuard.current !== token) return;
         setPendingRequest(false);
       });
-  }, []);
+  }, [canReplay]);
 
   // Autonomous mode: periodically triggers a *real* scenario change on the
   // backend (never fakes one locally) — the cadence reuses the same
   // Settings-driven interval the app already exposed for this purpose.
+  // Gated on the simulation actually running — while idle/paused a
+  // scenario change is rejected by the backend (see
+  // SimulationService._require_running_for_scenario), so cycling here
+  // while stopped would just spam 400s for no visible effect.
+  const isRunning = simulationStatus?.status === "running";
   useEffect(() => {
-    if (simulationMode !== "autonomous") return;
+    if (simulationMode !== "autonomous" || !isRunning) return;
     const cycleMs = Math.max(predictionIntervalMs * 6, 14000);
     const id = window.setInterval(() => {
       if (pendingRequest) return;
@@ -397,7 +424,41 @@ export function ScenarioEngineProvider({ children }: { children: ReactNode }) {
       selectScenario(next);
     }, cycleMs);
     return () => window.clearInterval(id);
-  }, [simulationMode, predictionIntervalMs, scenario, pendingRequest, selectScenario]);
+  }, [simulationMode, isRunning, predictionIntervalMs, scenario, pendingRequest, selectScenario]);
+
+  // --- simulation lifecycle actions (start/pause/resume/reset the tick
+  // loop itself) — same "real API, no local faking" pattern as the
+  // scenario actions above, but never conflated with resetScenario (which
+  // only resets *which* scenario is active, and works regardless of
+  // whether the simulation is running).
+  const runLifecycleAction = useCallback((action: () => Promise<SimulationStatusRead>, failureMessage: string) => {
+    setScenarioError(null);
+    setSimulationBusy(true);
+    action()
+      .catch((error: unknown) => {
+        setScenarioError(error instanceof Error ? error.message : failureMessage);
+      })
+      .finally(() => {
+        setSimulationBusy(false);
+      });
+  }, []);
+
+  const startSimulation = useCallback(
+    () => runLifecycleAction(apiClient.startSimulation, "Failed to start the simulation."),
+    [runLifecycleAction],
+  );
+  const pauseSimulation = useCallback(
+    () => runLifecycleAction(apiClient.pauseSimulation, "Failed to pause the simulation."),
+    [runLifecycleAction],
+  );
+  const resumeSimulation = useCallback(
+    () => runLifecycleAction(apiClient.resumeSimulation, "Failed to resume the simulation."),
+    [runLifecycleAction],
+  );
+  const resetSimulation = useCallback(
+    () => runLifecycleAction(apiClient.resetSimulation, "Failed to reset the simulation."),
+    [runLifecycleAction],
+  );
 
   const value = useMemo<ScenarioEngineValue>(
     () => ({
@@ -410,14 +471,25 @@ export function ScenarioEngineProvider({ children }: { children: ReactNode }) {
       clusterForecast: snapshot?.forecast.predictions ?? [],
       isLoading: snapshot == null,
       isReplaying,
+      canReplay,
       pulseKey,
       resetToken,
       scenarioError,
       selectScenario,
       triggerReplay,
       resetScenario,
+      simulationStatus,
+      isSimulationBusy: simulationBusy,
+      startSimulation,
+      pauseSimulation,
+      resumeSimulation,
+      resetSimulation,
     }),
-    [scenario, racks, metrics, ai, timelineEvents, snapshot, isReplaying, pulseKey, resetToken, scenarioError, selectScenario, triggerReplay, resetScenario],
+    [
+      scenario, racks, metrics, ai, timelineEvents, snapshot, isReplaying, canReplay, pulseKey, resetToken, scenarioError,
+      selectScenario, triggerReplay, resetScenario, simulationStatus, simulationBusy, startSimulation,
+      pauseSimulation, resumeSimulation, resetSimulation,
+    ],
   );
 
   return <ScenarioEngineContext.Provider value={value}>{children}</ScenarioEngineContext.Provider>;
