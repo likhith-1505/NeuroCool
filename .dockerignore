@@ -1,0 +1,17 @@
+# Keep the frontend build context small (see Dockerfile.frontend).
+.git
+node_modules
+dist
+build
+backend
+docs
+.claude
+.vscode
+.idea
+*.md
+.env
+.env.*
+!.env.example
+npm-debug.log*
+Dockerfile.frontend
+podman-compose.yml

@@ -1,0 +1,87 @@
+# Full-stack NeuroCool on Podman — PostgreSQL, Redis, the FastAPI backend,
+# and the built frontend, in one command.
+#
+#   podman compose up --build      # Podman 4.1+ (the `podman compose` provider)
+#   podman-compose up --build      # the standalone podman-compose tool
+#
+#   Frontend : http://localhost:3000
+#   API      : http://localhost:8000   (interactive docs at /docs)
+#
+# The backend always boots idle. Start the digital twin from the UI, or:
+#   curl -X POST http://localhost:8000/api/simulation/start
+#
+# The backend-only stack also runs under Podman directly:
+#   podman compose -f backend/docker-compose.yml up --build
+
+services:
+  db:
+    image: docker.io/library/postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: neurocool
+      POSTGRES_PASSWORD: neurocool
+      POSTGRES_DB: neurocool
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U neurocool -d neurocool"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: docker.io/library/redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: neurocool
+      POSTGRES_PASSWORD: neurocool
+      POSTGRES_DB: neurocool
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+      BACKEND_CORS_ORIGINS: "http://localhost:3000"
+      # --- NeuroCore AI (optional) --------------------------------------
+      # Without a key the copilot reports "unavailable" and everything else
+      # works unchanged. Uncomment and export the key to enable it:
+      #   AI_PROVIDER: gemini
+      #   GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    restart: unless-stopped
+    # VITE_API_URL is baked in at build time; the browser reaches the API on
+    # the host's published port 8000, so the http://localhost:8000 default in
+    # Frontend/lib/env.ts is already correct here. Override via build args if
+    # you publish the API on a different host/port.
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  redis_data:
